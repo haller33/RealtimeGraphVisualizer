@@ -2,7 +2,7 @@
 // Multi‑threaded with background layout using message passing (no shared graph).
 // UI thread owns one graph, layout thread owns another, synchronized via messages.
 // Compile: gcc -o graph_visualizer main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm
-// Usage: ./graph_visualizer [--spatial] [--background-layout] [--log-http] [--log-db] [--log-ui] [--ui-batch-size N]
+// Usage: ./graph_visualizer [--spatial] [--background-layout] [--layout-mode=force|tree|grid] [--log-http] [--log-db] [--log-ui] [--ui-batch-size N]
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +54,14 @@ bool use_cage = false;
 bool use_collisions = true;
 bool use_spatial_accel = false;
 bool use_background_layout = false;
+
+// ----------------------------- Layout mode ----------------------------------
+typedef enum {
+    LAYOUT_FORCE = 0,
+    LAYOUT_TREE,
+    LAYOUT_GRID
+} LayoutMode;
+LayoutMode layout_mode = LAYOUT_FORCE;
 
 // ----------------------------- Logging flags ---------------------------------
 bool log_http = false;
@@ -186,6 +194,122 @@ void apply_layout_update_to_back(LayoutUpdate *upd);
 
 // ----------------------------- Background layout thread ---------------------
 void* layout_thread_func(void *arg);
+
+// ----------------------------- Tree layout computation ----------------------
+void compute_tree_layout(Node *nodes, Edge *edges_list, int edges_count) {
+    if (!nodes) return;
+    // Build in‑degree counts to find roots
+    struct InDegree { int count; char id[64]; UT_hash_handle hh; } *in_deg = NULL;
+    for (Edge *e = edges_list; e < edges_list + edges_count; e++) {
+        struct InDegree *entry = NULL;
+        HASH_FIND_STR(in_deg, e->tgt, entry);
+        if (!entry) {
+            entry = malloc(sizeof(struct InDegree));
+            strcpy(entry->id, e->tgt);
+            entry->count = 0;
+            HASH_ADD_STR(in_deg, id, entry);
+        }
+        entry->count++;
+    }
+    // BFS from roots
+    int n_nodes = HASH_COUNT(nodes);
+    Node **queue = malloc(n_nodes * sizeof(Node*));
+    int head = 0, tail = 0;
+    // Also store depth in a hash
+    struct Depth { int depth; char id[64]; UT_hash_handle hh; } *depth_map = NULL;
+    // Enqueue nodes with in_deg == 0
+    for (Node *n = nodes; n; n = n->hh.next) {
+        struct InDegree *entry = NULL;
+        HASH_FIND_STR(in_deg, n->id, entry);
+        if (!entry || entry->count == 0) {
+            queue[tail++] = n;
+            struct Depth *d = malloc(sizeof(struct Depth));
+            strcpy(d->id, n->id);
+            d->depth = 0;
+            HASH_ADD_STR(depth_map, id, d);
+        }
+    }
+    while (head < tail) {
+        Node *cur = queue[head++];
+        struct Depth *cd = NULL;
+        HASH_FIND_STR(depth_map, cur->id, cd);
+        int cur_depth = cd ? cd->depth : 0;
+        // Find children
+        for (Edge *e = edges_list; e < edges_list + edges_count; e++) {
+            if (strcmp(e->src, cur->id) == 0) {
+                Node *child = NULL;
+                HASH_FIND_STR(nodes, e->tgt, child);
+                if (child) {
+                    struct Depth *child_d = NULL;
+                    HASH_FIND_STR(depth_map, child->id, child_d);
+                    if (!child_d) {
+                        queue[tail++] = child;
+                        child_d = malloc(sizeof(struct Depth));
+                        strcpy(child_d->id, child->id);
+                        child_d->depth = cur_depth + 1;
+                        HASH_ADD_STR(depth_map, id, child_d);
+                    }
+                }
+            }
+        }
+    }
+    // Assign positions: order by (depth, ID)
+    Node **sorted = malloc(n_nodes * sizeof(Node*));
+    int idx = 0;
+    for (Node *n = nodes; n; n = n->hh.next) sorted[idx++] = n;
+    for (int i = 0; i < n_nodes-1; i++)
+        for (int j = i+1; j < n_nodes; j++) {
+            struct Depth *di = NULL, *dj = NULL;
+            HASH_FIND_STR(depth_map, sorted[i]->id, di);
+            HASH_FIND_STR(depth_map, sorted[j]->id, dj);
+            int d_i = di ? di->depth : 0, d_j = dj ? dj->depth : 0;
+            if (d_i > d_j || (d_i == d_j && strcmp(sorted[i]->id, sorted[j]->id) > 0)) {
+                Node *tmp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = tmp;
+            }
+        }
+    float x_spacing = 200.0f, y_spacing = 150.0f;
+    for (int i = 0; i < n_nodes; i++) {
+        struct Depth *d = NULL;
+        HASH_FIND_STR(depth_map, sorted[i]->id, d);
+        int depth = d ? d->depth : 0;
+        sorted[i]->x = i * x_spacing;
+        sorted[i]->y = depth * y_spacing;
+    }
+    // Cleanup
+    struct InDegree *cur_in, *tmp_in;
+    HASH_ITER(hh, in_deg, cur_in, tmp_in) { HASH_DEL(in_deg, cur_in); free(cur_in); }
+    struct Depth *cur_d, *tmp_d;
+    HASH_ITER(hh, depth_map, cur_d, tmp_d) { HASH_DEL(depth_map, cur_d); free(cur_d); }
+    free(queue);
+    free(sorted);
+}
+
+void compute_grid_layout(Node *nodes) {
+    int n_nodes = HASH_COUNT(nodes);
+    if (n_nodes == 0) return;
+    Node **sorted = malloc(n_nodes * sizeof(Node*));
+    int idx = 0;
+    for (Node *n = nodes; n; n = n->hh.next) sorted[idx++] = n;
+    // Sort by ID (simple bubble sort, fine for moderate sizes)
+    for (int i = 0; i < n_nodes-1; i++)
+        for (int j = i+1; j < n_nodes; j++)
+            if (strcmp(sorted[i]->id, sorted[j]->id) > 0) {
+                Node *tmp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = tmp;
+            }
+    int cols = (int)sqrt(n_nodes) + 1;
+    float cell_w = 200.0f, cell_h = 150.0f;
+    for (int i = 0; i < n_nodes; i++) {
+        int row = i / cols;
+        int col = i % cols;
+        sorted[i]->x = col * cell_w;
+        sorted[i]->y = row * cell_h;
+    }
+    free(sorted);
+}
 
 // ----------------------------- Grid helpers (unchanged) ---------------------
 typedef struct GridCell {
@@ -1219,10 +1343,11 @@ void parse_args(int argc, char **argv) {
         {"ui-batch-size", required_argument, 0, 'b'},
         {"spatial",  no_argument, 0, 's'},
         {"background-layout", no_argument, 0, 'B'},
+        {"layout-mode", required_argument, 0, 'm'},
         {0, 0, 0, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "HDUb:sB", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "HDUb:sBm:", long_options, NULL)) != -1) {
         switch (c) {
             case 'H': log_http = true; break;
             case 'D': log_db = true; break;
@@ -1230,6 +1355,11 @@ void parse_args(int argc, char **argv) {
             case 'b': ui_batch_size = atoi(optarg); if (ui_batch_size <= 0) ui_batch_size = DEFAULT_UI_BATCH_SIZE; break;
             case 's': use_spatial_accel = true; break;
             case 'B': use_background_layout = true; break;
+            case 'm':
+                if (strcmp(optarg, "tree") == 0) layout_mode = LAYOUT_TREE;
+                else if (strcmp(optarg, "grid") == 0) layout_mode = LAYOUT_GRID;
+                else layout_mode = LAYOUT_FORCE;
+                break;
             default: break;
         }
     }
@@ -1269,6 +1399,23 @@ int main(int argc, char **argv) {
     // Load initial data into UI graph
     load_initial_data();
     add_sample_nodes();
+
+    // Apply non‑force layout if requested (this sets positions and disables dynamic layout)
+    if (layout_mode == LAYOUT_TREE) {
+        compute_tree_layout(nodes_ui, edges_list_ui, edges_count_ui);
+        layout_enabled = false;
+        if (log_ui) printf("Applied tree layout, dynamic layout disabled\n");
+    } else if (layout_mode == LAYOUT_GRID) {
+        compute_grid_layout(nodes_ui);
+        layout_enabled = false;
+        if (log_ui) printf("Applied grid layout, dynamic layout disabled\n");
+    }
+
+    // If background layout was requested but we are not in force mode, disable it
+    if (use_background_layout && layout_mode != LAYOUT_FORCE) {
+        use_background_layout = false;
+        if (log_ui) printf("Background layout disabled because non-force layout mode selected\n");
+    }
 
     // Start DB worker thread
     pthread_t db_thread;

@@ -81,6 +81,14 @@ app = Flask(__name__)
 def get_db_conn():
     return sqlite3.connect(DB_URI, uri=True, check_same_thread=False)
 
+def safe_json_loads(value):
+    if value is None:
+        return {}
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
 @app.route("/nodes", methods=["POST"])
 def add_node():
     data = request.json
@@ -161,7 +169,11 @@ def get_nodes_by_tag():
         cur.execute("SELECT id, label, x, y, metadata FROM nodes")
     nodes = [dict(row) for row in cur.fetchall()]
     for node in nodes:
-        node["metadata"] = json.loads(node["metadata"])
+        # node["metadata"] = json.loads(node["metadata"])
+        try:        
+            node["metadata"] = safe_json_loads(node["metadata"])
+        except (TypeError, json.JSONDecodeError):
+            node["metadata"] = {}
     conn.close()
     return jsonify(nodes)
 
@@ -172,7 +184,11 @@ def get_graph():
     cur.execute("SELECT id, label, x, y, metadata FROM nodes")
     nodes = [dict(row) for row in cur.fetchall()]
     for node in nodes:
-        node["metadata"] = json.loads(node["metadata"])
+        try:        
+            node["metadata"] = safe_json_loads(node["metadata"])
+        except (TypeError, json.JSONDecodeError):
+            node["metadata"] = {}
+        # node["metadata"] = json.loads(node["metadata"])
     cur.execute("SELECT source, target FROM edges")
     edges = [dict(row) for row in cur.fetchall()]
     conn.close()

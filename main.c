@@ -1,4 +1,6 @@
 // main.c – Graph Visualizer with Raylib + HTTP API + SQLite (C version)
+// Multi‑threaded version: HTTP thread, DB thread, UI thread.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +9,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
+#include <getopt.h>
 #include <sqlite3.h>
 #include <microhttpd.h>
 #include <cjson/cJSON.h>
@@ -17,7 +20,9 @@
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 #define FPS_TARGET    60
+#define DEFAULT_UI_BATCH_SIZE 5   // process at most 5 UI messages per frame
 
+// Force layout parameters (unchanged)
 #define REPULSION_STRENGTH      2500.0f
 #define ATTRACTION_STRENGTH     0.005f
 #define DESIRED_EDGE_LENGTH     150.0f
@@ -38,10 +43,16 @@
 
 // Global UI Flags
 bool layout_enabled = true;
-bool use_cage = false;        // Infinity canvas by default
+bool use_cage = false;
 bool use_collisions = true;
 
-// ----------------------------- Uthash structures ----------------------------
+// ----------------------------- Logging flags ---------------------------------
+bool log_http = false;
+bool log_db = false;
+bool log_ui = false;
+int ui_batch_size = DEFAULT_UI_BATCH_SIZE;
+
+// ----------------------------- Uthash structures (in-memory graph) ----------
 typedef struct Node {
     char id[64];
     char label[128];
@@ -68,6 +79,14 @@ typedef struct NodeTags {
     UT_hash_handle hh;
 } NodeTags;
 
+// Forward declarations for in‑memory graph helpers
+void mem_add_node(const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count);
+void mem_add_edge(const char *src, const char *tgt);
+void mem_add_tags(const char *node_id, const char **tags, int tag_count);
+void mem_delete_node(const char *node_id);
+void mem_delete_edge(const char *src, const char *tgt);
+void rebuild_edge_list(void);
+
 Node *nodes = NULL;
 EdgeSet *edges_set = NULL;
 NodeTags *tags_hash = NULL;
@@ -80,56 +99,54 @@ Edge *edges_list = NULL;
 int edges_count = 0;
 int edges_capacity = 0;
 
-// ----------------------------- Database & Queue ------------------------------
+// ----------------------------- Database & persistent storage -----------------
 static const char *DB_URI = "file::memory:?cache=shared";
-sqlite3 *db = NULL;
+sqlite3 *db = NULL;                // used only for initial load and by DB thread
 
+// ----------------------------- Task queue for DB operations -----------------
 typedef enum {
-    MSG_ADD_NODE,
-    MSG_ADD_EDGE,
-    MSG_ADD_TAGS,
-    MSG_DELETE_NODE,
-    MSG_DELETE_EDGE
-} MsgType;
+    TASK_ADD_NODE,
+    TASK_ADD_EDGE,
+    TASK_ADD_TAGS,
+    TASK_DELETE_NODE,
+    TASK_DELETE_EDGE
+} TaskType;
 
-typedef struct QueueMsg {
-    MsgType type;
+typedef struct DBTask {
+    TaskType type;
+    char id1[64];     // node id or source
+    char id2[64];     // label (for add node) or target
+    char *metadata;   // JSON string (for node)
+    char *tags_str;   // comma-separated tags
+    struct DBTask *next;
+} DBTask;
+
+DBTask *task_head = NULL, *task_tail = NULL;
+pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t task_cond = PTHREAD_COND_INITIALIZER;
+
+// ----------------------------- UI message queue (for Raylib) -----------------
+typedef struct UIMsg {
+    TaskType type;       // reusing same enum
     char id1[64];
     char id2[64];
     char *metadata;
     char *tags_str;
-    struct QueueMsg *next;
-} QueueMsg;
+    struct UIMsg *next;
+} UIMsg;
 
-QueueMsg *queue_head = NULL, *queue_tail = NULL;
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+UIMsg *ui_head = NULL, *ui_tail = NULL;
+pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void enqueue_msg(QueueMsg *msg) {
-    pthread_mutex_lock(&queue_mutex);
-    msg->next = NULL;
-    if (queue_tail) {
-        queue_tail->next = msg;
-        queue_tail = msg;
-    } else {
-        queue_head = queue_tail = msg;
-    }
-    pthread_cond_signal(&queue_cond);
-    pthread_mutex_unlock(&queue_mutex);
-}
+// Forward declarations for queue functions
+void enqueue_task(DBTask *task);
+DBTask* dequeue_task(void);
+void enqueue_ui_msg(UIMsg *msg);
+UIMsg* dequeue_ui_msg(void);
+void free_ui_msg(UIMsg *msg);
+void process_ui_messages(int max_count);
 
-QueueMsg* dequeue_msg_nonblock(void) {
-    pthread_mutex_lock(&queue_mutex);
-    QueueMsg *msg = queue_head;
-    if (msg) {
-        queue_head = msg->next;
-        if (!queue_head) queue_tail = NULL;
-    }
-    pthread_mutex_unlock(&queue_mutex);
-    return msg;
-}
-
-// ----------------------------- SQLite helpers --------------------------------
+// ----------------------------- SQLite helpers (used by DB thread) -----------
 sqlite3* get_db_conn(void) {
     sqlite3 *conn;
     sqlite3_open(DB_URI, &conn);
@@ -137,91 +154,520 @@ sqlite3* get_db_conn(void) {
     return conn;
 }
 
-void init_database(void) {
-    sqlite3_open(DB_URI, &db);
-    sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
-    const char *sql =
-        "CREATE TABLE IF NOT EXISTS nodes ("
-        "  id TEXT PRIMARY KEY,"
-        "  label TEXT,"
-        "  x REAL,"
-        "  y REAL,"
-        "  metadata TEXT"
-        ");"
-        "CREATE TABLE IF NOT EXISTS edges ("
-        "  source TEXT,"
-        "  target TEXT,"
-        "  PRIMARY KEY (source, target)"
-        ");"
-        "CREATE TABLE IF NOT EXISTS node_tags ("
-        "  node_id TEXT,"
-        "  tag TEXT,"
-        "  PRIMARY KEY (node_id, tag),"
-        "  FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE"
-        ");";
-    char *errmsg = NULL;
-    sqlite3_exec(db, sql, NULL, NULL, &errmsg);
-    if (errmsg) { fprintf(stderr, "SQL error: %s\n", errmsg); sqlite3_free(errmsg); }
-}
-
-void db_insert_node(const char *id, const char *label, float x, float y, const char *metadata) {
-    sqlite3 *conn = get_db_conn();
+void db_insert_node_task(DBTask *task) {
+    sqlite3 *conn = get_db_conn();   // each task uses its own connection (simple)
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(conn, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, label, -1, SQLITE_STATIC);
+    const char *sql = "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)";
+    sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL);
+    // random position for new node
+    float x = (float)((rand() % 1000) - 500);
+    float y = (float)((rand() % 1000) - 500);
+    sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, task->id2, -1, SQLITE_STATIC);
     sqlite3_bind_double(stmt, 3, x);
     sqlite3_bind_double(stmt, 4, y);
-    sqlite3_bind_text(stmt, 5, metadata, -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
+    sqlite3_bind_text(stmt, 5, task->metadata, -1, SQLITE_STATIC);
+    if (sqlite3_step(stmt) != SQLITE_DONE && log_db)
+        fprintf(stderr, "DB: insert node failed: %s\n", sqlite3_errmsg(conn));
     sqlite3_finalize(stmt);
+    // tags
+    if (task->tags_str && strlen(task->tags_str) > 0) {
+        char *copy = strdup(task->tags_str);
+        char *token = strtok(copy, ",");
+        while (token) {
+            sqlite3_prepare_v2(conn, "INSERT OR IGNORE INTO node_tags (node_id, tag) VALUES (?,?)", -1, &stmt, NULL);
+            sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
+            sqlite3_bind_text(stmt, 2, token, -1, SQLITE_STATIC);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+            token = strtok(NULL, ",");
+        }
+        free(copy);
+    }
     sqlite3_close(conn);
+    if (log_db) printf("DB: added node %s\n", task->id1);
 }
 
-void db_insert_edge(const char *src, const char *tgt) {
+void db_insert_edge_task(DBTask *task) {
     sqlite3 *conn = get_db_conn();
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(conn, "INSERT OR IGNORE INTO edges (source, target) VALUES (?,?)", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, src, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, tgt, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, task->id2, -1, SQLITE_STATIC);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     sqlite3_close(conn);
+    if (log_db) printf("DB: added edge %s->%s\n", task->id1, task->id2);
 }
 
-void db_insert_tag(const char *node_id, const char *tag) {
+void db_insert_tags_task(DBTask *task) {
+    float x = task->x;    // add float x,y to DBTask
+    float y = task->y;
+    if (isnan(x)) { x = (float)((rand()%1000)-500); }
+    if (isnan(y)) { y = (float)((rand()%1000)-500); }
+    if (!task->tags_str || strlen(task->tags_str) == 0) return;
     sqlite3 *conn = get_db_conn();
+    char *copy = strdup(task->tags_str);
+    char *token = strtok(copy, ",");
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(conn, "INSERT OR IGNORE INTO node_tags (node_id, tag) VALUES (?,?)", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, node_id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, tag, -1, SQLITE_STATIC);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    while (token) {
+        sqlite3_prepare_v2(conn, "INSERT OR IGNORE INTO node_tags (node_id, tag) VALUES (?,?)", -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, token, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        token = strtok(NULL, ",");
+    }
+    free(copy);
     sqlite3_close(conn);
+    if (log_db) printf("DB: added tags to %s: %s\n", task->id1, task->tags_str);
 }
 
-void db_delete_node(const char *node_id) {
+void db_delete_node_task(DBTask *task) {
     sqlite3 *conn = get_db_conn();
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(conn, "DELETE FROM nodes WHERE id = ?", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, node_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     sqlite3_close(conn);
+    if (log_db) printf("DB: deleted node %s\n", task->id1);
 }
 
-void db_delete_edge(const char *src, const char *tgt) {
+void db_delete_edge_task(DBTask *task) {
     sqlite3 *conn = get_db_conn();
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(conn, "DELETE FROM edges WHERE source = ? AND target = ?", -1, &stmt, NULL);
-    sqlite3_bind_text(stmt, 1, src, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, tgt, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, task->id2, -1, SQLITE_STATIC);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     sqlite3_close(conn);
+    if (log_db) printf("DB: deleted edge %s->%s\n", task->id1, task->id2);
 }
 
-// ----------------------------- In-memory helpers ----------------------------
+// ----------------------------- Queue management -----------------------------
+void enqueue_task(DBTask *task) {
+    pthread_mutex_lock(&task_mutex);
+    task->next = NULL;
+    if (task_tail) {
+        task_tail->next = task;
+        task_tail = task;
+    } else {
+        task_head = task_tail = task;
+    }
+    pthread_cond_signal(&task_cond);
+    pthread_mutex_unlock(&task_mutex);
+}
+
+DBTask* dequeue_task(void) {
+    pthread_mutex_lock(&task_mutex);
+    while (task_head == NULL) {
+        pthread_cond_wait(&task_cond, &task_mutex);
+    }
+    DBTask *task = task_head;
+    task_head = task->next;
+    if (!task_head) task_tail = NULL;
+    pthread_mutex_unlock(&task_mutex);
+    return task;
+}
+
+void enqueue_ui_msg(UIMsg *msg) {
+    pthread_mutex_lock(&ui_mutex);
+    msg->next = NULL;
+    if (ui_tail) {
+        ui_tail->next = msg;
+        ui_tail = msg;
+    } else {
+        ui_head = ui_tail = msg;
+    }
+    pthread_mutex_unlock(&ui_mutex);
+}
+
+UIMsg* dequeue_ui_msg(void) {
+    pthread_mutex_lock(&ui_mutex);
+    UIMsg *msg = ui_head;
+    if (msg) {
+        ui_head = msg->next;
+        if (!ui_head) ui_tail = NULL;
+    }
+    pthread_mutex_unlock(&ui_mutex);
+    return msg;
+}
+
+void free_ui_msg(UIMsg *msg) {
+    if (msg->metadata) free(msg->metadata);
+    if (msg->tags_str) free(msg->tags_str);
+    free(msg);
+}
+
+void process_ui_messages(int max_count) {
+    int processed = 0;
+    UIMsg *msg;
+    while (processed < max_count && (msg = dequeue_ui_msg()) != NULL) {
+        switch (msg->type) {
+            case TASK_ADD_NODE: {
+                int tag_cnt = 0;
+                const char **tags = NULL;
+                if (msg->tags_str && strlen(msg->tags_str) > 0) {
+                    char *copy = strdup(msg->tags_str);
+                    char *token = strtok(copy, ",");
+                    while (token) {
+                        tags = realloc(tags, (tag_cnt+1)*sizeof(const char*));
+                        tags[tag_cnt++] = strdup(token);
+                        token = strtok(NULL, ",");
+                    }
+                    free(copy);
+                }
+                float x = (float)((rand() % 1000) - 500);
+                float y = (float)((rand() % 1000) - 500);
+                mem_add_node(msg->id1, msg->id2, x, y, msg->metadata, tags, tag_cnt);
+                for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
+                free(tags);
+                if (log_ui) printf("UI: added node %s\n", msg->id1);
+                break;
+            }
+            case TASK_ADD_EDGE:
+                mem_add_edge(msg->id1, msg->id2);
+                if (log_ui) printf("UI: added edge %s->%s\n", msg->id1, msg->id2);
+                break;
+            case TASK_ADD_TAGS: {
+                char *copy = strdup(msg->tags_str);
+                char *token = strtok(copy, ",");
+                const char **tags = NULL;
+                int cnt = 0;
+                while (token) {
+                    tags = realloc(tags, (cnt+1)*sizeof(const char*));
+                    tags[cnt++] = strdup(token);
+                    token = strtok(NULL, ",");
+                }
+                mem_add_tags(msg->id1, tags, cnt);
+                for (int i=0; i<cnt; i++) free((void*)tags[i]);
+                free(tags);
+                free(copy);
+                if (log_ui) printf("UI: added tags to %s\n", msg->id1);
+                break;
+            }
+            case TASK_DELETE_NODE:
+                mem_delete_node(msg->id1);
+                if (log_ui) printf("UI: deleted node %s\n", msg->id1);
+                break;
+            case TASK_DELETE_EDGE:
+                mem_delete_edge(msg->id1, msg->id2);
+                if (log_ui) printf("UI: deleted edge %s->%s\n", msg->id1, msg->id2);
+                break;
+        }
+        free_ui_msg(msg);
+        processed++;
+    }
+}
+
+// ----------------------------- Database thread ------------------------------
+void* db_thread_func(void *arg) {
+    (void)arg;
+    if (log_db) printf("DB thread started\n");
+    while (1) {
+        DBTask *task = dequeue_task();
+        if (!task) continue;
+        switch (task->type) {
+            case TASK_ADD_NODE:
+                db_insert_node_task(task);
+                break;
+            case TASK_ADD_EDGE:
+                db_insert_edge_task(task);
+                break;
+            case TASK_ADD_TAGS:
+                db_insert_tags_task(task);
+                break;
+            case TASK_DELETE_NODE:
+                db_delete_node_task(task);
+                break;
+            case TASK_DELETE_EDGE:
+                db_delete_edge_task(task);
+                break;
+        }
+        // After successful DB operation, forward to UI thread
+        UIMsg *uimsg = calloc(1, sizeof(UIMsg));
+        uimsg->type = task->type;
+        strncpy(uimsg->id1, task->id1, sizeof(uimsg->id1)-1);
+        strncpy(uimsg->id2, task->id2, sizeof(uimsg->id2)-1);
+        if (task->metadata) uimsg->metadata = strdup(task->metadata);
+        if (task->tags_str) uimsg->tags_str = strdup(task->tags_str);
+        enqueue_ui_msg(uimsg);
+        // Clean up task
+        if (task->metadata) free(task->metadata);
+        if (task->tags_str) free(task->tags_str);
+        free(task);
+    }
+    return NULL;
+}
+
+// ----------------------------- HTTP Server (thread) -------------------------
+static struct MHD_Daemon *http_daemon = NULL;
+
+typedef struct {
+    char *payload;
+    size_t size;
+} ReqState;
+
+enum MHD_Result send_json_response(struct MHD_Connection *connection, int status_code, const char *json_str) {
+    struct MHD_Response *resp = MHD_create_response_from_buffer(strlen(json_str), (void*)json_str, MHD_RESPMEM_MUST_COPY);
+    MHD_add_response_header(resp, "Content-Type", "application/json");
+    int ret = MHD_queue_response(connection, status_code, resp);
+    MHD_destroy_response(resp);
+    return ret;
+}
+
+static void request_completed(void *cls, struct MHD_Connection *connection,
+                              void **con_cls, enum MHD_RequestTerminationCode toe) {
+    if (*con_cls) {
+        ReqState *state = (ReqState *)*con_cls;
+        if (state->payload) free(state->payload);
+        free(state);
+        *con_cls = NULL;
+    }
+}
+
+enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
+                               const char *url, const char *method,
+                               const char *version, const char *upload_data,
+                               size_t *upload_data_size, void **con_cls) {
+    (void)cls; (void)version;
+
+    if (strcmp(method, "POST") == 0) {
+        ReqState *state = (ReqState *)*con_cls;
+        if (!state) {
+            state = calloc(1, sizeof(ReqState));
+            *con_cls = state;
+            return MHD_YES;
+        }
+        if (*upload_data_size > 0) {
+            state->payload = realloc(state->payload, state->size + *upload_data_size + 1);
+            memcpy(state->payload + state->size, upload_data, *upload_data_size);
+            state->size += *upload_data_size;
+            state->payload[state->size] = '\0';
+            *upload_data_size = 0;
+            return MHD_YES;
+        }
+
+        char *post = state->payload ? state->payload : strdup("");
+        cJSON *json = cJSON_Parse(post);
+        if (state->payload == NULL) free(post);
+
+        if (!json) return send_json_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
+
+        if (strcmp(url, "/nodes") == 0) {
+            cJSON *id = cJSON_GetObjectItem(json, "id");
+            if (!cJSON_IsString(id)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing id\"}"); }
+            const char *id_str = id->valuestring;
+            cJSON *label = cJSON_GetObjectItem(json, "label");
+            const char *label_str = (label && cJSON_IsString(label)) ? label->valuestring : id_str;
+            cJSON *metadata = cJSON_GetObjectItem(json, "metadata");
+            char *meta_str = metadata ? cJSON_PrintUnformatted(metadata) : strdup("{}");
+
+            cJSON *tags = cJSON_GetObjectItem(json, "tags");
+            int actual_tag_cnt = 0;
+            const char **tag_arr = NULL;
+            if (cJSON_IsArray(tags)) {
+                int total_cnt = cJSON_GetArraySize(tags);
+                tag_arr = malloc(total_cnt * sizeof(const char*));
+                for (int i = 0; i < total_cnt; i++) {
+                    cJSON *t = cJSON_GetArrayItem(tags, i);
+                    if (cJSON_IsString(t)) tag_arr[actual_tag_cnt++] = t->valuestring;
+                }
+            }
+
+            // Build comma-separated tags string
+            char *tags_buf = NULL;
+            if (actual_tag_cnt > 0) {
+                size_t buf_len = 1;
+                for (int i=0; i<actual_tag_cnt; i++) buf_len += strlen(tag_arr[i]) + 1;
+                tags_buf = calloc(1, buf_len);
+                for (int i=0; i<actual_tag_cnt; i++) {
+                    strcat(tags_buf, tag_arr[i]);
+                    if (i<actual_tag_cnt-1) strcat(tags_buf, ",");
+                }
+            } else {
+                tags_buf = strdup("");
+            }
+
+            DBTask *task = calloc(1, sizeof(DBTask));
+            task->type = TASK_ADD_NODE;
+            strncpy(task->id1, id_str, sizeof(task->id1)-1);
+            strncpy(task->id2, label_str, sizeof(task->id2)-1);
+            task->metadata = meta_str;
+            task->tags_str = tags_buf;
+            enqueue_task(task);
+
+            free((void*)tag_arr);
+            cJSON_Delete(json);
+            if (log_http) printf("HTTP: queued ADD_NODE %s\n", id_str);
+            return send_json_response(connection, 202, "{\"status\":\"accepted\"}");
+        }
+        else if (strcmp(url, "/edges") == 0) {
+            cJSON *src = cJSON_GetObjectItem(json, "source");
+            cJSON *tgt = cJSON_GetObjectItem(json, "target");
+            if (!cJSON_IsString(src) || !cJSON_IsString(tgt)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing source/target\"}"); }
+            DBTask *task = calloc(1, sizeof(DBTask));
+            task->type = TASK_ADD_EDGE;
+            strncpy(task->id1, src->valuestring, sizeof(task->id1)-1);
+            strncpy(task->id2, tgt->valuestring, sizeof(task->id2)-1);
+            enqueue_task(task);
+            cJSON_Delete(json);
+            if (log_http) printf("HTTP: queued ADD_EDGE %s->%s\n", src->valuestring, tgt->valuestring);
+            return send_json_response(connection, 202, "{\"status\":\"accepted\"}");
+        }
+        else if (strncmp(url, "/nodes/", 7) == 0 && strstr(url, "/tags")) {
+            char node_id[64] = {0};
+            sscanf(url, "/nodes/%63[^/]/tags", node_id);
+            cJSON *tags = cJSON_GetObjectItem(json, "tags");
+            if (!cJSON_IsArray(tags)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing tags array\"}"); }
+
+            int total_cnt = cJSON_GetArraySize(tags);
+            const char **tag_arr = malloc(total_cnt * sizeof(const char*));
+            int actual_tag_cnt = 0;
+            for (int i=0; i<total_cnt; i++) {
+                cJSON *t = cJSON_GetArrayItem(tags, i);
+                if (cJSON_IsString(t)) tag_arr[actual_tag_cnt++] = t->valuestring;
+            }
+
+            char *tags_buf = NULL;
+            if (actual_tag_cnt > 0) {
+                size_t buf_len = 1;
+                for (int i=0; i<actual_tag_cnt; i++) buf_len += strlen(tag_arr[i]) + 1;
+                tags_buf = calloc(1, buf_len);
+                for (int i=0; i<actual_tag_cnt; i++) {
+                    strcat(tags_buf, tag_arr[i]);
+                    if (i<actual_tag_cnt-1) strcat(tags_buf, ",");
+                }
+            } else {
+                tags_buf = strdup("");
+            }
+
+            DBTask *task = calloc(1, sizeof(DBTask));
+            task->type = TASK_ADD_TAGS;
+            strncpy(task->id1, node_id, sizeof(task->id1)-1);
+            task->tags_str = tags_buf;
+            enqueue_task(task);
+
+            free((void*)tag_arr);
+            cJSON_Delete(json);
+            if (log_http) printf("HTTP: queued ADD_TAGS for %s\n", node_id);
+            return send_json_response(connection, 202, "{\"status\":\"accepted\"}");
+        }
+
+        cJSON_Delete(json);
+        return MHD_NO;
+    }
+    else if (strcmp(method, "DELETE") == 0) {
+        if (strncmp(url, "/nodes/", 7) == 0 && strlen(url) > 7) {
+            char node_id[64] = {0};
+            strncpy(node_id, url + 7, sizeof(node_id)-1);
+            DBTask *task = calloc(1, sizeof(DBTask));
+            task->type = TASK_DELETE_NODE;
+            strncpy(task->id1, node_id, sizeof(task->id1)-1);
+            enqueue_task(task);
+            if (log_http) printf("HTTP: queued DELETE_NODE %s\n", node_id);
+            return send_json_response(connection, 202, "{\"status\":\"accepted\"}");
+        }
+        else if (strcmp(url, "/edges") == 0) {
+            const char *src = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "source");
+            const char *tgt = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "target");
+            if (!src || !tgt) return send_json_response(connection, 400, "{\"error\":\"Missing source/target\"}");
+            DBTask *task = calloc(1, sizeof(DBTask));
+            task->type = TASK_DELETE_EDGE;
+            strncpy(task->id1, src, sizeof(task->id1)-1);
+            strncpy(task->id2, tgt, sizeof(task->id2)-1);
+            enqueue_task(task);
+            if (log_http) printf("HTTP: queued DELETE_EDGE %s->%s\n", src, tgt);
+            return send_json_response(connection, 202, "{\"status\":\"accepted\"}");
+        }
+    }
+    // GET requests (unchanged) – they read directly from SQLite, no queue
+    else if (strcmp(method, "GET") == 0) {
+        if (strcmp(url, "/nodes") == 0) {
+            const char *tag = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "tag");
+            sqlite3 *conn = get_db_conn();
+            sqlite3_stmt *stmt;
+            if (tag) {
+                sqlite3_prepare_v2(conn, "SELECT n.id, n.label, n.x, n.y, n.metadata FROM nodes n JOIN node_tags t ON n.id = t.node_id WHERE t.tag = ?", -1, &stmt, NULL);
+                sqlite3_bind_text(stmt, 1, tag, -1, SQLITE_STATIC);
+            } else {
+                sqlite3_prepare_v2(conn, "SELECT id, label, x, y, metadata FROM nodes", -1, &stmt, NULL);
+            }
+            cJSON *arr = cJSON_CreateArray();
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                cJSON *obj = cJSON_CreateObject();
+                cJSON_AddStringToObject(obj, "id", (const char*)sqlite3_column_text(stmt, 0));
+                cJSON_AddStringToObject(obj, "label", (const char*)sqlite3_column_text(stmt, 1));
+                cJSON_AddNumberToObject(obj, "x", sqlite3_column_double(stmt, 2));
+                cJSON_AddNumberToObject(obj, "y", sqlite3_column_double(stmt, 3));
+                const char *meta = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
+                cJSON *meta_json = cJSON_Parse(meta);
+                if (!meta_json) meta_json = cJSON_CreateObject();
+                cJSON_AddItemToObject(obj, "metadata", meta_json);
+                cJSON_AddItemToArray(arr, obj);
+            }
+            sqlite3_finalize(stmt);
+            sqlite3_close(conn);
+            char *json_str = cJSON_PrintUnformatted(arr);
+            cJSON_Delete(arr);
+            enum MHD_Result ret = send_json_response(connection, 200, json_str);
+            free(json_str);
+            return ret;
+        }
+        else if (strcmp(url, "/graph") == 0) {
+            sqlite3 *conn = get_db_conn();
+            sqlite3_stmt *stmt;
+            cJSON *root = cJSON_CreateObject();
+            cJSON *nodes_arr = cJSON_CreateArray();
+            cJSON *edges_arr = cJSON_CreateArray();
+            sqlite3_prepare_v2(conn, "SELECT id, label, x, y, metadata FROM nodes", -1, &stmt, NULL);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                cJSON *obj = cJSON_CreateObject();
+                cJSON_AddStringToObject(obj, "id", (const char*)sqlite3_column_text(stmt, 0));
+                cJSON_AddStringToObject(obj, "label", (const char*)sqlite3_column_text(stmt, 1));
+                cJSON_AddNumberToObject(obj, "x", sqlite3_column_double(stmt, 2));
+                cJSON_AddNumberToObject(obj, "y", sqlite3_column_double(stmt, 3));
+                const char *meta = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
+                cJSON *meta_json = cJSON_Parse(meta);
+                if (!meta_json) meta_json = cJSON_CreateObject();
+                cJSON_AddItemToObject(obj, "metadata", meta_json);
+                cJSON_AddItemToArray(nodes_arr, obj);
+            }
+            sqlite3_finalize(stmt);
+            sqlite3_prepare_v2(conn, "SELECT source, target FROM edges", -1, &stmt, NULL);
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                cJSON *obj = cJSON_CreateObject();
+                cJSON_AddStringToObject(obj, "source", (const char*)sqlite3_column_text(stmt, 0));
+                cJSON_AddStringToObject(obj, "target", (const char*)sqlite3_column_text(stmt, 1));
+                cJSON_AddItemToArray(edges_arr, obj);
+            }
+            sqlite3_finalize(stmt);
+            sqlite3_close(conn);
+            cJSON_AddItemToObject(root, "nodes", nodes_arr);
+            cJSON_AddItemToObject(root, "edges", edges_arr);
+            char *json_str = cJSON_PrintUnformatted(root);
+            cJSON_Delete(root);
+            enum MHD_Result ret = send_json_response(connection, 200, json_str);
+            free(json_str);
+            return ret;
+        }
+    }
+    return MHD_NO;
+}
+
+void* http_thread_func(void *arg) {
+    (void)arg;
+    http_daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, 5000, NULL, NULL, &handle_request, NULL,
+                                   MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL, MHD_OPTION_END);
+    if (!http_daemon) { fprintf(stderr, "Failed to start HTTP server on 5000\n"); exit(1); }
+    printf("API server running on http://localhost:5000\n");
+    while (1) sleep(1);
+    return NULL;
+}
+
+// ----------------------------- In‑memory helpers (definitions) --------------
 void mem_add_node(const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count) {
     Node *node = malloc(sizeof(Node));
     strncpy(node->id, id, sizeof(node->id)-1);
@@ -351,6 +797,7 @@ void mem_delete_edge(const char *src, const char *tgt) {
     rebuild_edge_list();
 }
 
+// ----------------------------- Initial data load  ---------------------------
 void load_initial_data(void) {
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(db, "SELECT id, label, x, y, metadata FROM nodes", -1, &stmt, NULL);
@@ -386,15 +833,43 @@ void add_sample_nodes(void) {
         mem_add_node("sample1", "Node Alpha", -150.0f, -80.0f, meta, tags1, 1);
         mem_add_node("sample2", "Node Beta", 180.0f, 90.0f, meta, tags1, 1);
         mem_add_edge("sample1", "sample2");
-        db_insert_node("sample1", "Node Alpha", -150.0f, -80.0f, meta);
-        db_insert_node("sample2", "Node Beta", 180.0f, 90.0f, meta);
-        db_insert_edge("sample1", "sample2");
-        db_insert_tag("sample1", "sample");
-        db_insert_tag("sample2", "sample");
+        // Also persist them via DB thread? For simplicity, insert directly into DB now.
+        sqlite3_stmt *stmt;
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, "sample1", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, "Node Alpha", -1, SQLITE_STATIC);
+        sqlite3_bind_double(stmt, 3, -150.0);
+        sqlite3_bind_double(stmt, 4, -80.0);
+        sqlite3_bind_text(stmt, 5, meta, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, "sample2", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, "Node Beta", -1, SQLITE_STATIC);
+        sqlite3_bind_double(stmt, 3, 180.0);
+        sqlite3_bind_double(stmt, 4, 90.0);
+        sqlite3_bind_text(stmt, 5, meta, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO edges (source, target) VALUES (?,?)", -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, "sample1", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, "sample2", -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO node_tags (node_id, tag) VALUES (?,?)", -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, "sample1", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, "sample", -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO node_tags (node_id, tag) VALUES (?,?)", -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, "sample2", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, "sample", -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
     }
 }
 
-// ----------------------------- Force layout --------------------------------
+// ----------------------------- Force layout (unchanged) --------------------
 void resolve_collisions(void) {
     Node *n1, *n2;
     for (n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
@@ -462,292 +937,80 @@ void update_layout(void) {
         n1->y += fy * TIME_STEP;
         n1->fx *= DAMPING;
         n1->fy *= DAMPING;
-
-        // Toggleable Cage
         if (use_cage) {
             n1->x = fmaxf(50.0f, fminf(WINDOW_WIDTH - 50.0f, n1->x));
             n1->y = fmaxf(50.0f, fminf(WINDOW_HEIGHT - 50.0f, n1->y));
         }
     }
-    
-    // Toggleable Collisions
     if (use_collisions) resolve_collisions();
 }
 
-// ----------------------------- HTTP Server ----------------------------------
-static struct MHD_Daemon *http_daemon = NULL;
-
-typedef struct {
-    char *payload;
-    size_t size;
-} ReqState;
-
-enum MHD_Result send_json_response(struct MHD_Connection *connection, int status_code, const char *json_str) {
-    struct MHD_Response *resp = MHD_create_response_from_buffer(strlen(json_str), (void*)json_str, MHD_RESPMEM_MUST_COPY);
-    MHD_add_response_header(resp, "Content-Type", "application/json");
-    int ret = MHD_queue_response(connection, status_code, resp);
-    MHD_destroy_response(resp);
-    return ret;
-}
-
-static void request_completed(void *cls, struct MHD_Connection *connection,
-                              void **con_cls, enum MHD_RequestTerminationCode toe) {
-    if (*con_cls) {
-        ReqState *state = (ReqState *)*con_cls;
-        if (state->payload) free(state->payload);
-        free(state);
-        *con_cls = NULL;
+// ----------------------------- Command line parsing -------------------------
+void parse_args(int argc, char **argv) {
+    static struct option long_options[] = {
+        {"log-http", no_argument, 0, 'H'},
+        {"log-db",   no_argument, 0, 'D'},
+        {"log-ui",   no_argument, 0, 'U'},
+        {"ui-batch-size", required_argument, 0, 'b'},
+        {0, 0, 0, 0}
+    };
+    int c;
+    while ((c = getopt_long(argc, argv, "HDUb:", long_options, NULL)) != -1) {
+        switch (c) {
+            case 'H': log_http = true; break;
+            case 'D': log_db = true; break;
+            case 'U': log_ui = true; break;
+            case 'b': ui_batch_size = atoi(optarg); if (ui_batch_size <= 0) ui_batch_size = DEFAULT_UI_BATCH_SIZE; break;
+            default: break;
+        }
     }
 }
 
-enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
-                               const char *url, const char *method,
-                               const char *version, const char *upload_data,
-                               size_t *upload_data_size, void **con_cls) {
-    (void)cls; (void)version;
-
-    if (strcmp(method, "POST") == 0) {
-        ReqState *state = (ReqState *)*con_cls;
-        if (!state) {
-            state = calloc(1, sizeof(ReqState));
-            *con_cls = state;
-            return MHD_YES;
-        }
-        if (*upload_data_size > 0) {
-            state->payload = realloc(state->payload, state->size + *upload_data_size + 1);
-            memcpy(state->payload + state->size, upload_data, *upload_data_size);
-            state->size += *upload_data_size;
-            state->payload[state->size] = '\0';
-            *upload_data_size = 0;
-            return MHD_YES;
-        }
-
-        char *post = state->payload ? state->payload : strdup("");
-        cJSON *json = cJSON_Parse(post);
-        if (state->payload == NULL) free(post); 
-
-        if (!json) return send_json_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
-
-        if (strcmp(url, "/nodes") == 0) {
-            cJSON *id = cJSON_GetObjectItem(json, "id");
-            if (!cJSON_IsString(id)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing id\"}"); }
-            const char *id_str = id->valuestring;
-            cJSON *label = cJSON_GetObjectItem(json, "label");
-            const char *label_str = (label && cJSON_IsString(label)) ? label->valuestring : id_str;
-            cJSON *metadata = cJSON_GetObjectItem(json, "metadata");
-            char *meta_str = metadata ? cJSON_PrintUnformatted(metadata) : strdup("{}");
-
-            cJSON *tags = cJSON_GetObjectItem(json, "tags");
-            int actual_tag_cnt = 0;
-            const char **tag_arr = NULL;
-
-            if (cJSON_IsArray(tags)) {
-                int total_cnt = cJSON_GetArraySize(tags);
-                tag_arr = malloc(total_cnt * sizeof(const char*));
-                for (int i = 0; i < total_cnt; i++) {
-                    cJSON *t = cJSON_GetArrayItem(tags, i);
-                    if (cJSON_IsString(t)) tag_arr[actual_tag_cnt++] = t->valuestring;
-                }
-            }
-
-            // Centralized Spawning (better for infinity canvas)
-            float x = (float)((rand() % 1000) - 500);
-            float y = (float)((rand() % 1000) - 500);
-            db_insert_node(id_str, label_str, x, y, meta_str);
-            for (int i=0; i<actual_tag_cnt; i++) db_insert_tag(id_str, tag_arr[i]);
-
-            QueueMsg *msg = calloc(1, sizeof(QueueMsg));
-            msg->type = MSG_ADD_NODE;
-            strncpy(msg->id1, id_str, sizeof(msg->id1)-1);
-            strncpy(msg->id2, label_str, sizeof(msg->id2)-1);
-            msg->metadata = meta_str;
-
-            if (actual_tag_cnt > 0) {
-                size_t buf_len = 1;
-                for(int i=0; i<actual_tag_cnt; i++) buf_len += strlen(tag_arr[i]) + 1;
-                char *tags_buf = calloc(1, buf_len);
-                for (int i=0; i<actual_tag_cnt; i++) {
-                    strcat(tags_buf, tag_arr[i]);
-                    if (i<actual_tag_cnt-1) strcat(tags_buf, ",");
-                }
-                msg->tags_str = tags_buf;
-            } else {
-                msg->tags_str = strdup("");
-            }
-
-            enqueue_msg(msg);
-            free((void*)tag_arr);
-            cJSON_Delete(json);
-            return send_json_response(connection, 201, "{\"status\":\"ok\"}");
-        }
-        else if (strcmp(url, "/edges") == 0) {
-            cJSON *src = cJSON_GetObjectItem(json, "source");
-            cJSON *tgt = cJSON_GetObjectItem(json, "target");
-            if (!cJSON_IsString(src) || !cJSON_IsString(tgt)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing source/target\"}"); }
-            db_insert_edge(src->valuestring, tgt->valuestring);
-            QueueMsg *msg = calloc(1, sizeof(QueueMsg));
-            msg->type = MSG_ADD_EDGE;
-            strncpy(msg->id1, src->valuestring, sizeof(msg->id1)-1);
-            strncpy(msg->id2, tgt->valuestring, sizeof(msg->id2)-1);
-            enqueue_msg(msg);
-            cJSON_Delete(json);
-            return send_json_response(connection, 201, "{\"status\":\"ok\"}");
-        }
-        else if (strncmp(url, "/nodes/", 7) == 0 && strstr(url, "/tags")) {
-            char node_id[64] = {0};
-            sscanf(url, "/nodes/%63[^/]/tags", node_id);
-            cJSON *tags = cJSON_GetObjectItem(json, "tags");
-            if (!cJSON_IsArray(tags)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing tags array\"}"); }
-
-            int total_cnt = cJSON_GetArraySize(tags);
-            const char **tag_arr = malloc(total_cnt * sizeof(const char*));
-            int actual_tag_cnt = 0;
-            for (int i=0; i<total_cnt; i++) {
-                cJSON *t = cJSON_GetArrayItem(tags, i);
-                if (cJSON_IsString(t)) {
-                    tag_arr[actual_tag_cnt++] = t->valuestring;
-                    db_insert_tag(node_id, t->valuestring);
-                }
-            }
-
-            QueueMsg *msg = calloc(1, sizeof(QueueMsg));
-            msg->type = MSG_ADD_TAGS;
-            strncpy(msg->id1, node_id, sizeof(msg->id1)-1);
-            
-            size_t buf_len = 1;
-            for(int i=0; i<actual_tag_cnt; i++) buf_len += strlen(tag_arr[i]) + 1;
-            char *tags_buf = calloc(1, buf_len);
-            for (int i=0; i<actual_tag_cnt; i++) {
-                strcat(tags_buf, tag_arr[i]);
-                if (i<actual_tag_cnt-1) strcat(tags_buf, ",");
-            }
-            msg->tags_str = tags_buf;
-
-            enqueue_msg(msg);
-            free((void*)tag_arr);
-            cJSON_Delete(json);
-            return send_json_response(connection, 200, "{\"status\":\"ok\"}");
-        }
-
-        cJSON_Delete(json);
-        return MHD_NO;
-    }
-    else if (strcmp(method, "GET") == 0) {
-        if (strcmp(url, "/nodes") == 0) {
-            const char *tag = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "tag");
-            sqlite3 *conn = get_db_conn();
-            sqlite3_stmt *stmt;
-            if (tag) {
-                sqlite3_prepare_v2(conn, "SELECT n.id, n.label, n.x, n.y, n.metadata FROM nodes n JOIN node_tags t ON n.id = t.node_id WHERE t.tag = ?", -1, &stmt, NULL);
-                sqlite3_bind_text(stmt, 1, tag, -1, SQLITE_STATIC);
-            } else {
-                sqlite3_prepare_v2(conn, "SELECT id, label, x, y, metadata FROM nodes", -1, &stmt, NULL);
-            }
-            cJSON *arr = cJSON_CreateArray();
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                cJSON *obj = cJSON_CreateObject();
-                cJSON_AddStringToObject(obj, "id", (const char*)sqlite3_column_text(stmt, 0));
-                cJSON_AddStringToObject(obj, "label", (const char*)sqlite3_column_text(stmt, 1));
-                cJSON_AddNumberToObject(obj, "x", sqlite3_column_double(stmt, 2));
-                cJSON_AddNumberToObject(obj, "y", sqlite3_column_double(stmt, 3));
-                const char *meta = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
-                cJSON *meta_json = cJSON_Parse(meta);
-                if (!meta_json) meta_json = cJSON_CreateObject();
-                cJSON_AddItemToObject(obj, "metadata", meta_json);
-                cJSON_AddItemToArray(arr, obj);
-            }
-            sqlite3_finalize(stmt);
-            sqlite3_close(conn);
-            char *json_str = cJSON_PrintUnformatted(arr);
-            cJSON_Delete(arr);
-            enum MHD_Result ret = send_json_response(connection, 200, json_str);
-            free(json_str);
-            return ret;
-        }
-        else if (strcmp(url, "/graph") == 0) {
-            sqlite3 *conn = get_db_conn();
-            sqlite3_stmt *stmt;
-            cJSON *root = cJSON_CreateObject();
-            cJSON *nodes_arr = cJSON_CreateArray();
-            cJSON *edges_arr = cJSON_CreateArray();
-            sqlite3_prepare_v2(conn, "SELECT id, label, x, y, metadata FROM nodes", -1, &stmt, NULL);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                cJSON *obj = cJSON_CreateObject();
-                cJSON_AddStringToObject(obj, "id", (const char*)sqlite3_column_text(stmt, 0));
-                cJSON_AddStringToObject(obj, "label", (const char*)sqlite3_column_text(stmt, 1));
-                cJSON_AddNumberToObject(obj, "x", sqlite3_column_double(stmt, 2));
-                cJSON_AddNumberToObject(obj, "y", sqlite3_column_double(stmt, 3));
-                const char *meta = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
-                cJSON *meta_json = cJSON_Parse(meta);
-                if (!meta_json) meta_json = cJSON_CreateObject();
-                cJSON_AddItemToObject(obj, "metadata", meta_json);
-                cJSON_AddItemToArray(nodes_arr, obj);
-            }
-            sqlite3_finalize(stmt);
-            sqlite3_prepare_v2(conn, "SELECT source, target FROM edges", -1, &stmt, NULL);
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                cJSON *obj = cJSON_CreateObject();
-                cJSON_AddStringToObject(obj, "source", (const char*)sqlite3_column_text(stmt, 0));
-                cJSON_AddStringToObject(obj, "target", (const char*)sqlite3_column_text(stmt, 1));
-                cJSON_AddItemToArray(edges_arr, obj);
-            }
-            sqlite3_finalize(stmt);
-            sqlite3_close(conn);
-            cJSON_AddItemToObject(root, "nodes", nodes_arr);
-            cJSON_AddItemToObject(root, "edges", edges_arr);
-            char *json_str = cJSON_PrintUnformatted(root);
-            cJSON_Delete(root);
-            enum MHD_Result ret = send_json_response(connection, 200, json_str);
-            free(json_str);
-            return ret;
-        }
-    }
-    else if (strcmp(method, "DELETE") == 0) {
-        if (strncmp(url, "/nodes/", 7) == 0 && strlen(url) > 7) {
-            char node_id[64] = {0};
-            strncpy(node_id, url + 7, sizeof(node_id)-1);
-            db_delete_node(node_id);
-            QueueMsg *msg = calloc(1, sizeof(QueueMsg));
-            msg->type = MSG_DELETE_NODE;
-            strncpy(msg->id1, node_id, sizeof(msg->id1)-1);
-            enqueue_msg(msg);
-            return send_json_response(connection, 200, "{\"status\":\"ok\"}");
-        }
-        else if (strcmp(url, "/edges") == 0) {
-            const char *src = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "source");
-            const char *tgt = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "target");
-            if (!src || !tgt) return send_json_response(connection, 400, "{\"error\":\"Missing source/target\"}");
-            db_delete_edge(src, tgt);
-            QueueMsg *msg = calloc(1, sizeof(QueueMsg));
-            msg->type = MSG_DELETE_EDGE;
-            strncpy(msg->id1, src, sizeof(msg->id1)-1);
-            strncpy(msg->id2, tgt, sizeof(msg->id2)-1);
-            enqueue_msg(msg);
-            return send_json_response(connection, 200, "{\"status\":\"ok\"}");
-        }
-    }
-    return MHD_NO;
-}
-
-void* run_http_server(void *arg) {
-    (void)arg;
-    // Updated port to 5000 to resolve binding conflicts
-    http_daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, 5000, NULL, NULL, &handle_request, NULL, 
-                                   MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL, MHD_OPTION_END);
-    if (!http_daemon) { fprintf(stderr, "Failed to start HTTP server on 5000\n"); exit(1); }
-    printf("API server running on http://localhost:5000\n");
-    while (1) sleep(1);
-    return NULL;
-}
-
-// ----------------------------- Main (Raylib) --------------------------------
-int main(void) {
+// ----------------------------- Main (UI thread) -----------------------------
+int main(int argc, char **argv) {
+    parse_args(argc, argv);
     srand((unsigned)time(NULL));
-    init_database();
+
+    // Open database and create schema
+    sqlite3_open(DB_URI, &db);
+    sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS nodes ("
+        "  id TEXT PRIMARY KEY,"
+        "  label TEXT,"
+        "  x REAL,"
+        "  y REAL,"
+        "  metadata TEXT"
+        ");"
+        "CREATE TABLE IF NOT EXISTS edges ("
+        "  source TEXT,"
+        "  target TEXT,"
+        "  PRIMARY KEY (source, target)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS node_tags ("
+        "  node_id TEXT,"
+        "  tag TEXT,"
+        "  PRIMARY KEY (node_id, tag),"
+        "  FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE"
+        ");";
+    char *errmsg = NULL;
+    sqlite3_exec(db, sql, NULL, NULL, &errmsg);
+    if (errmsg) { fprintf(stderr, "SQL error: %s\n", errmsg); sqlite3_free(errmsg); }
+
+    // Load initial data into memory (synchronous, before UI starts)
     load_initial_data();
     add_sample_nodes();
 
-    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Graph Visualizer (C)");
+    // Start DB worker thread
+    pthread_t db_thread;
+    pthread_create(&db_thread, NULL, db_thread_func, NULL);
+
+    // Start HTTP thread
+    pthread_t http_thread;
+    pthread_create(&http_thread, NULL, http_thread_func, NULL);
+
+    // Initialize Raylib window
+    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Graph Visualizer (C) - Multi‑threaded");
     SetTargetFPS(FPS_TARGET);
 
     Camera2D camera = { 0 };
@@ -759,66 +1022,12 @@ int main(void) {
     char search_text[64] = {0};
     Node *selected_node = NULL;
 
-    pthread_t http_thread;
-    pthread_create(&http_thread, NULL, run_http_server, NULL);
-
+    // Main loop
     while (!WindowShouldClose()) {
-        QueueMsg *msg;
-        while ((msg = dequeue_msg_nonblock()) != NULL) {
-            switch (msg->type) {
-                case MSG_ADD_NODE: {
-                    int tag_cnt = 0;
-                    const char **tags = NULL;
-                    if (msg->tags_str && strlen(msg->tags_str) > 0) {
-                        char *copy = strdup(msg->tags_str);
-                        char *token = strtok(copy, ",");
-                        while (token) {
-                            tags = realloc(tags, (tag_cnt+1)*sizeof(const char*));
-                            tags[tag_cnt++] = strdup(token);
-                            token = strtok(NULL, ",");
-                        }
-                        free(copy);
-                    }
-                    float x = (float)((rand() % 1000) - 500);
-                    float y = (float)((rand() % 1000) - 500);
-                    mem_add_node(msg->id1, msg->id2, x, y, msg->metadata, tags, tag_cnt);
-                    for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
-                    free(tags);
-                    free(msg->metadata);
-                    free(msg->tags_str);
-                    break;
-                }
-                case MSG_ADD_EDGE:
-                    mem_add_edge(msg->id1, msg->id2);
-                    break;
-                case MSG_ADD_TAGS: {
-                    char *copy = strdup(msg->tags_str);
-                    char *token = strtok(copy, ",");
-                    const char **tags = NULL;
-                    int cnt = 0;
-                    while (token) {
-                        tags = realloc(tags, (cnt+1)*sizeof(const char*));
-                        tags[cnt++] = strdup(token);
-                        token = strtok(NULL, ",");
-                    }
-                    mem_add_tags(msg->id1, tags, cnt);
-                    for (int i=0; i<cnt; i++) free((void*)tags[i]);
-                    free(tags);
-                    free(copy);
-                    free(msg->tags_str);
-                    break;
-                }
-                case MSG_DELETE_NODE:
-                    mem_delete_node(msg->id1);
-                    break;
-                case MSG_DELETE_EDGE:
-                    mem_delete_edge(msg->id1, msg->id2);
-                    break;
-            }
-            free(msg);
-        }
+        // Process UI messages in batches to keep FPS stable
+        process_ui_messages(ui_batch_size);
 
-        // --- Input Handling ---
+        // --- Input Handling (unchanged) ---
         if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
             Vector2 delta = GetMouseDelta();
             camera.target.x -= delta.x / camera.zoom;
@@ -840,12 +1049,9 @@ int main(void) {
             } else camera.target = (Vector2){ 0, 0 };
             camera.zoom = 1.0f;
         }
-
-        // UI Toggles via Keyboard
         if (IsKeyPressed(KEY_L)) layout_enabled = !layout_enabled;
         if (IsKeyPressed(KEY_C)) use_cage = !use_cage;
         if (IsKeyPressed(KEY_X)) use_collisions = !use_collisions;
-
         if (IsKeyPressed(KEY_S)) {
             search_active = !search_active;
             memset(search_text, 0, sizeof(search_text));
@@ -881,7 +1087,7 @@ int main(void) {
         for (int i = 0; i < ITERATIONS_PER_FRAME && layout_enabled; i++)
             update_layout();
 
-        // --- Drawing ---
+        // --- Drawing (unchanged) ---
         BeginDrawing();
         ClearBackground(SOLARIZED_BASE03);
         BeginMode2D(camera);
@@ -921,15 +1127,11 @@ int main(void) {
 
         EndMode2D();
 
-        // --- UI Overlays ---
         DrawText(TextFormat("FPS: %d", GetFPS()), 10, 10, 20, WHITE);
-        
-        // Status Indicators
         int y_off = 40;
         DrawText(layout_enabled ? "[L] Layout: ON" : "[L] Layout: OFF", 10, y_off, 16, layout_enabled ? LIME : RED); y_off += 20;
         DrawText(use_cage ? "[C] Cage: ON" : "[C] Cage: OFF (Infinity)", 10, y_off, 16, use_cage ? LIME : SKYBLUE); y_off += 20;
         DrawText(use_collisions ? "[X] Collisions: ON" : "[X] Collisions: OFF", 10, y_off, 16, use_collisions ? LIME : ORANGE);
-
         DrawText("[S] Search | [R] Reset Camera | Middle-Mouse: Pan | Scroll: Zoom", 10, WINDOW_HEIGHT-30, 16, LIGHTGRAY);
 
         if (search_active) {
@@ -968,6 +1170,7 @@ int main(void) {
         EndDrawing();
     }
 
+    // Cleanup (the daemons and threads will be terminated, but for simplicity we exit)
     MHD_stop_daemon(http_daemon);
     sqlite3_close(db);
     CloseWindow();

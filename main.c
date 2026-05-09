@@ -80,7 +80,7 @@ typedef struct Node {
 } Node;
 
 typedef struct EdgeSet {
-    char key[128];
+    char key[256];               // Increased buffer to avoid truncation (was 128)
     UT_hash_handle hh;
 } EdgeSet;
 
@@ -101,7 +101,7 @@ typedef struct Edge {
     char tgt[64];
 } Edge;
 
-// Forward declarations for graph helpers (now accept pointer to the graph’s root)
+// Forward declarations for graph helpers
 void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count);
 void mem_add_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt);
 void mem_add_tags(NodeTags **tags_hash, const char *node_id, const char **tags, int tag_count);
@@ -173,6 +173,7 @@ typedef struct LayoutUpdate {
     char id2[64];
     char *metadata;
     char *tags_str;
+    float x, y;                     // coordinates for ADD_NODE
     struct LayoutUpdate *next;
 } LayoutUpdate;
 
@@ -180,7 +181,7 @@ LayoutUpdate *layout_update_head = NULL, *layout_update_tail = NULL;
 pthread_mutex_t layout_update_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t layout_update_cond = PTHREAD_COND_INITIALIZER;
 
-// Forward declarations for queue functions
+// ----------------------------- Forward declarations -------------------------
 void enqueue_task(DBTask *task);
 DBTask* dequeue_task(void);
 void enqueue_ui_msg(UIMsg *msg);
@@ -191,14 +192,32 @@ void enqueue_layout_update(LayoutUpdate *upd);
 LayoutUpdate* dequeue_layout_update(void);
 void free_layout_update(LayoutUpdate *upd);
 void apply_layout_update_to_back(LayoutUpdate *upd);
-
-// ----------------------------- Background layout thread ---------------------
 void* layout_thread_func(void *arg);
+
+// ----------------------------- Comparator for qsort -------------------------
+typedef struct SortNodeDepth {
+    Node *node;
+    int depth;
+} SortNodeDepth;
+
+int cmp_sort_node_depth(const void *a, const void *b) {
+    const SortNodeDepth *sa = (const SortNodeDepth*)a;
+    const SortNodeDepth *sb = (const SortNodeDepth*)b;
+    if (sa->depth != sb->depth) return sa->depth - sb->depth;
+    return strcmp(sa->node->id, sb->node->id);
+}
+
+int cmp_node_id(const void *a, const void *b) {
+    const Node *na = *(const Node**)a;
+    const Node *nb = *(const Node**)b;
+    return strcmp(na->id, nb->id);
+}
 
 // ----------------------------- Tree layout computation ----------------------
 void compute_tree_layout(Node *nodes, Edge *edges_list, int edges_count) {
     if (!nodes) return;
-    // Build in‑degree counts to find roots
+
+    // Build in-degree hash
     struct InDegree { int count; char id[64]; UT_hash_handle hh; } *in_deg = NULL;
     for (Edge *e = edges_list; e < edges_list + edges_count; e++) {
         struct InDegree *entry = NULL;
@@ -211,95 +230,129 @@ void compute_tree_layout(Node *nodes, Edge *edges_list, int edges_count) {
         }
         entry->count++;
     }
-    // BFS from roots
+
     int n_nodes = HASH_COUNT(nodes);
     Node **queue = malloc(n_nodes * sizeof(Node*));
     int head = 0, tail = 0;
-    // Also store depth in a hash
     struct Depth { int depth; char id[64]; UT_hash_handle hh; } *depth_map = NULL;
-    // Enqueue nodes with in_deg == 0
+    struct Visited { char id[64]; UT_hash_handle hh; } *visited = NULL;
+
+    // Helper macro to enqueue a node
+    #define ENQUEUE(n, d) do { \
+        struct Visited *v_ = NULL; \
+        HASH_FIND_STR(visited, (n)->id, v_); \
+        if (!v_) { \
+            v_ = malloc(sizeof(struct Visited)); \
+            strcpy(v_->id, (n)->id); \
+            HASH_ADD_STR(visited, id, v_); \
+            queue[tail++] = (n); \
+            struct Depth *d_ = malloc(sizeof(struct Depth)); \
+            strcpy(d_->id, (n)->id); \
+            d_->depth = (d); \
+            HASH_ADD_STR(depth_map, id, d_); \
+        } \
+    } while(0)
+
+    // Initial roots (in-degree == 0)
     for (Node *n = nodes; n; n = n->hh.next) {
         struct InDegree *entry = NULL;
         HASH_FIND_STR(in_deg, n->id, entry);
         if (!entry || entry->count == 0) {
-            queue[tail++] = n;
-            struct Depth *d = malloc(sizeof(struct Depth));
-            strcpy(d->id, n->id);
-            d->depth = 0;
-            HASH_ADD_STR(depth_map, id, d);
+            ENQUEUE(n, 0);
         }
     }
+
+    // BFS to assign depths
     while (head < tail) {
         Node *cur = queue[head++];
         struct Depth *cd = NULL;
         HASH_FIND_STR(depth_map, cur->id, cd);
         int cur_depth = cd ? cd->depth : 0;
-        // Find children
         for (Edge *e = edges_list; e < edges_list + edges_count; e++) {
             if (strcmp(e->src, cur->id) == 0) {
                 Node *child = NULL;
                 HASH_FIND_STR(nodes, e->tgt, child);
                 if (child) {
-                    struct Depth *child_d = NULL;
-                    HASH_FIND_STR(depth_map, child->id, child_d);
-                    if (!child_d) {
-                        queue[tail++] = child;
-                        child_d = malloc(sizeof(struct Depth));
-                        strcpy(child_d->id, child->id);
-                        child_d->depth = cur_depth + 1;
-                        HASH_ADD_STR(depth_map, id, child_d);
+                    struct Visited *cv = NULL;
+                    HASH_FIND_STR(visited, child->id, cv);
+                    if (!cv) {
+                        ENQUEUE(child, cur_depth + 1);
                     }
                 }
             }
         }
     }
-    // Assign positions: order by (depth, ID)
-    Node **sorted = malloc(n_nodes * sizeof(Node*));
-    int idx = 0;
-    for (Node *n = nodes; n; n = n->hh.next) sorted[idx++] = n;
-    for (int i = 0; i < n_nodes-1; i++)
-        for (int j = i+1; j < n_nodes; j++) {
-            struct Depth *di = NULL, *dj = NULL;
-            HASH_FIND_STR(depth_map, sorted[i]->id, di);
-            HASH_FIND_STR(depth_map, sorted[j]->id, dj);
-            int d_i = di ? di->depth : 0, d_j = dj ? dj->depth : 0;
-            if (d_i > d_j || (d_i == d_j && strcmp(sorted[i]->id, sorted[j]->id) > 0)) {
-                Node *tmp = sorted[i];
-                sorted[i] = sorted[j];
-                sorted[j] = tmp;
+
+    // For any node not visited (cyclic components), assign depth 0 and continue BFS
+    for (Node *n = nodes; n; n = n->hh.next) {
+        struct Visited *v = NULL;
+        HASH_FIND_STR(visited, n->id, v);
+        if (!v) {
+            ENQUEUE(n, 0);
+            // Resume BFS from this artificial root
+            while (head < tail) {
+                Node *cur = queue[head++];
+                struct Depth *cd = NULL;
+                HASH_FIND_STR(depth_map, cur->id, cd);
+                int cur_depth = cd ? cd->depth : 0;
+                for (Edge *e = edges_list; e < edges_list + edges_count; e++) {
+                    if (strcmp(e->src, cur->id) == 0) {
+                        Node *child = NULL;
+                        HASH_FIND_STR(nodes, e->tgt, child);
+                        if (child) {
+                            struct Visited *cv = NULL;
+                            HASH_FIND_STR(visited, child->id, cv);
+                            if (!cv) {
+                                ENQUEUE(child, cur_depth + 1);
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    #undef ENQUEUE
+
+    // Sort nodes by depth then ID using qsort
+    typedef struct { Node *node; int depth; } SortNodeDepth;
+    SortNodeDepth *sort_arr = malloc(n_nodes * sizeof(SortNodeDepth));
+    int idx = 0;
+    for (Node *n = nodes; n; n = n->hh.next) {
+        struct Depth *d = NULL;
+        HASH_FIND_STR(depth_map, n->id, d);
+        sort_arr[idx].node = n;
+        sort_arr[idx].depth = d ? d->depth : 0;
+        idx++;
+    }
+    qsort(sort_arr, n_nodes, sizeof(SortNodeDepth), cmp_sort_node_depth);
+
     float x_spacing = 200.0f, y_spacing = 150.0f;
     for (int i = 0; i < n_nodes; i++) {
-        struct Depth *d = NULL;
-        HASH_FIND_STR(depth_map, sorted[i]->id, d);
-        int depth = d ? d->depth : 0;
-        sorted[i]->x = i * x_spacing;
-        sorted[i]->y = depth * y_spacing;
+        sort_arr[i].node->x = i * x_spacing;
+        sort_arr[i].node->y = sort_arr[i].depth * y_spacing;
     }
+
     // Cleanup
     struct InDegree *cur_in, *tmp_in;
     HASH_ITER(hh, in_deg, cur_in, tmp_in) { HASH_DEL(in_deg, cur_in); free(cur_in); }
     struct Depth *cur_d, *tmp_d;
     HASH_ITER(hh, depth_map, cur_d, tmp_d) { HASH_DEL(depth_map, cur_d); free(cur_d); }
+    struct Visited *cur_v, *tmp_v;
+    HASH_ITER(hh, visited, cur_v, tmp_v) { HASH_DEL(visited, cur_v); free(cur_v); }
     free(queue);
-    free(sorted);
+    free(sort_arr);
 }
 
+// ----------------------------- Grid layout computation ----------------------
 void compute_grid_layout(Node *nodes) {
     int n_nodes = HASH_COUNT(nodes);
     if (n_nodes == 0) return;
     Node **sorted = malloc(n_nodes * sizeof(Node*));
     int idx = 0;
     for (Node *n = nodes; n; n = n->hh.next) sorted[idx++] = n;
-    // Sort by ID (simple bubble sort, fine for moderate sizes)
-    for (int i = 0; i < n_nodes-1; i++)
-        for (int j = i+1; j < n_nodes; j++)
-            if (strcmp(sorted[i]->id, sorted[j]->id) > 0) {
-                Node *tmp = sorted[i];
-                sorted[i] = sorted[j];
-                sorted[j] = tmp;
-            }
+    qsort(sorted, n_nodes, sizeof(Node*), cmp_node_id);
+
     int cols = (int)sqrt(n_nodes) + 1;
     float cell_w = 200.0f, cell_h = 150.0f;
     for (int i = 0; i < n_nodes; i++) {
@@ -469,7 +522,7 @@ void compute_layout_iteration(Node *nodes, Edge *edges_list, int edges_count, bo
     }
 }
 
-// ----------------------------- SQLite helpers (unchanged) -------------------
+// ----------------------------- SQLite helpers (with persistent connection) -
 sqlite3* get_db_conn(void) {
     sqlite3 *conn;
     sqlite3_open(db_uri, &conn);
@@ -477,8 +530,8 @@ sqlite3* get_db_conn(void) {
     return conn;
 }
 
-void db_insert_node_task(DBTask *task) {
-    sqlite3 *conn = get_db_conn();
+void db_insert_node_task(DBTask *task, sqlite3 *conn) {
+    // Use the given persistent connection
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(conn, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
     float x = (float)((rand() % 1000) - 500);
@@ -504,25 +557,19 @@ void db_insert_node_task(DBTask *task) {
         }
         free(copy);
     }
-    sqlite3_close(conn);
-    if (log_db) printf("DB: added node %s\n", task->id1);
 }
 
-void db_insert_edge_task(DBTask *task) {
-    sqlite3 *conn = get_db_conn();
+void db_insert_edge_task(DBTask *task, sqlite3 *conn) {
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(conn, "INSERT OR IGNORE INTO edges (source, target) VALUES (?,?)", -1, &stmt, NULL);
     sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, task->id2, -1, SQLITE_STATIC);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    sqlite3_close(conn);
-    if (log_db) printf("DB: added edge %s->%s\n", task->id1, task->id2);
 }
 
-void db_insert_tags_task(DBTask *task) {
+void db_insert_tags_task(DBTask *task, sqlite3 *conn) {
     if (!task->tags_str || strlen(task->tags_str) == 0) return;
-    sqlite3 *conn = get_db_conn();
     char *copy = strdup(task->tags_str);
     char *token = strtok(copy, ",");
     sqlite3_stmt *stmt;
@@ -535,31 +582,23 @@ void db_insert_tags_task(DBTask *task) {
         token = strtok(NULL, ",");
     }
     free(copy);
-    sqlite3_close(conn);
-    if (log_db) printf("DB: added tags to %s: %s\n", task->id1, task->tags_str);
 }
 
-void db_delete_node_task(DBTask *task) {
-    sqlite3 *conn = get_db_conn();
+void db_delete_node_task(DBTask *task, sqlite3 *conn) {
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(conn, "DELETE FROM nodes WHERE id = ?", -1, &stmt, NULL);
     sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    sqlite3_close(conn);
-    if (log_db) printf("DB: deleted node %s\n", task->id1);
 }
 
-void db_delete_edge_task(DBTask *task) {
-    sqlite3 *conn = get_db_conn();
+void db_delete_edge_task(DBTask *task, sqlite3 *conn) {
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(conn, "DELETE FROM edges WHERE source = ? AND target = ?", -1, &stmt, NULL);
     sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, task->id2, -1, SQLITE_STATIC);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    sqlite3_close(conn);
-    if (log_db) printf("DB: deleted edge %s->%s\n", task->id1, task->id2);
 }
 
 // ----------------------------- Queue management -----------------------------
@@ -652,8 +691,9 @@ void apply_layout_update_to_back(LayoutUpdate *upd) {
                 }
                 free(copy);
             }
-            float x = (float)((rand() % 1000) - 500);
-            float y = (float)((rand() % 1000) - 500);
+            // Use the coordinates from the UI message instead of random
+            float x = upd->x;
+            float y = upd->y;
             mem_add_node(&nodes_layout, &tags_hash_layout, upd->id1, upd->id2, x, y, upd->metadata, tags, tag_cnt);
             for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
             free(tags);
@@ -710,12 +750,14 @@ void process_ui_messages(int max_count) {
                 float x = (float)((rand() % 1000) - 500);
                 float y = (float)((rand() % 1000) - 500);
                 mem_add_node(&nodes_ui, &tags_hash_ui, msg->id1, msg->id2, x, y, msg->metadata, tags, tag_cnt);
-                // Also send to layout thread
+                // Also send to layout thread, including the exact coordinates
                 LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
                 upd->type = TASK_ADD_NODE;
                 strcpy(upd->id1, msg->id1); strcpy(upd->id2, msg->id2);
                 if (msg->metadata) upd->metadata = strdup(msg->metadata);
                 if (msg->tags_str) upd->tags_str = strdup(msg->tags_str);
+                upd->x = x;
+                upd->y = y;
                 enqueue_layout_update(upd);
                 for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
                 free(tags);
@@ -772,7 +814,6 @@ void process_ui_messages(int max_count) {
                 break;
             }
             case TASK_POSITION_UPDATE: {
-                // Apply batched position updates to UI graph
                 for (int i = 0; i < msg->pos_count; i++) {
                     Node *node = NULL;
                     HASH_FIND_STR(nodes_ui, msg->pos_updates[i].id, node);
@@ -793,19 +834,21 @@ void process_ui_messages(int max_count) {
     }
 }
 
-// ----------------------------- Database thread ------------------------------
+// ----------------------------- Database thread (persistent connection) -----
 void* db_thread_func(void *arg) {
     (void)arg;
     if (log_db) printf("DB thread started\n");
+    // Open a single connection for the lifetime of this thread
+    sqlite3 *conn = get_db_conn();
     while (1) {
         DBTask *task = dequeue_task();
         if (!task) continue;
         switch (task->type) {
-            case TASK_ADD_NODE: db_insert_node_task(task); break;
-            case TASK_ADD_EDGE: db_insert_edge_task(task); break;
-            case TASK_ADD_TAGS: db_insert_tags_task(task); break;
-            case TASK_DELETE_NODE: db_delete_node_task(task); break;
-            case TASK_DELETE_EDGE: db_delete_edge_task(task); break;
+            case TASK_ADD_NODE: db_insert_node_task(task, conn); break;
+            case TASK_ADD_EDGE: db_insert_edge_task(task, conn); break;
+            case TASK_ADD_TAGS: db_insert_tags_task(task, conn); break;
+            case TASK_DELETE_NODE: db_delete_node_task(task, conn); break;
+            case TASK_DELETE_EDGE: db_delete_edge_task(task, conn); break;
             default: if (log_db) printf("DB thread ignoring task type %d\n", task->type); break;
         }
         if (task->type != TASK_POSITION_UPDATE) {
@@ -820,6 +863,7 @@ void* db_thread_func(void *arg) {
         if (task->tags_str) free(task->tags_str);
         free(task);
     }
+    sqlite3_close(conn);
     return NULL;
 }
 
@@ -828,7 +872,6 @@ void* layout_thread_func(void *arg) {
     (void)arg;
     if (log_ui) printf("Layout thread started\n");
 
-    // Clone the UI graph into layout graph at start
     for (Node *n = nodes_ui; n; n = n->hh.next) {
         mem_add_node(&nodes_layout, &tags_hash_layout, n->id, n->label, n->x, n->y, n->metadata, NULL, 0);
     }
@@ -838,20 +881,17 @@ void* layout_thread_func(void *arg) {
     }
 
     while (1) {
-        // Apply any pending structural updates
         LayoutUpdate *upd;
         while ((upd = dequeue_layout_update()) != NULL) {
             apply_layout_update_to_back(upd);
             free_layout_update(upd);
         }
 
-        // Run one layout iteration on the layout copy
         if (layout_enabled && nodes_layout) {
             compute_layout_iteration(nodes_layout, edges_list_layout, edges_count_layout,
                                      use_spatial_accel, use_cage, use_collisions);
         }
 
-        // Build a batch of position updates (all nodes)
         int node_count = HASH_COUNT(nodes_layout);
         if (node_count > 0) {
             UIMsg *pos_msg = calloc(1, sizeof(UIMsg));
@@ -868,8 +908,7 @@ void* layout_thread_func(void *arg) {
             enqueue_ui_msg(pos_msg);
         }
 
-        // Throttle to avoid flooding UI (roughly 60 updates per second)
-        struct timespec ts = {0, 10000000}; // 10 ms
+        struct timespec ts = {0, 10000000};
         nanosleep(&ts, NULL);
     }
     return NULL;
@@ -1252,7 +1291,7 @@ void mem_delete_node(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set, Ed
 }
 
 void mem_delete_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt) {
-    char key[128];
+    char key[256];  // Increased buffer
     snprintf(key, sizeof(key), "%s|%s", src, tgt);
     EdgeSet *e = NULL;
     HASH_FIND_STR(*edges_set, key, e);
@@ -1374,7 +1413,6 @@ int main(int argc, char **argv) {
     parse_args(argc, argv);
     srand((unsigned)time(NULL));
 
-    // Open database and create schema
     sqlite3_open(db_uri, &db);
     sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
     const char *sql =
@@ -1400,11 +1438,9 @@ int main(int argc, char **argv) {
     sqlite3_exec(db, sql, NULL, NULL, &errmsg);
     if (errmsg) { fprintf(stderr, "SQL error: %s\n", errmsg); sqlite3_free(errmsg); }
 
-    // Load initial data into UI graph
     load_initial_data();
     add_sample_nodes();
 
-    // Apply non‑force layout if requested (this sets positions and disables dynamic layout)
     if (layout_mode == LAYOUT_TREE) {
         compute_tree_layout(nodes_ui, edges_list_ui, edges_count_ui);
         layout_enabled = false;
@@ -1415,28 +1451,23 @@ int main(int argc, char **argv) {
         if (log_ui) printf("Applied grid layout, dynamic layout disabled\n");
     }
 
-    // If background layout was requested but we are not in force mode, disable it
     if (use_background_layout && layout_mode != LAYOUT_FORCE) {
         use_background_layout = false;
         if (log_ui) printf("Background layout disabled because non-force layout mode selected\n");
     }
 
-    // Start DB worker thread
     pthread_t db_thread;
     pthread_create(&db_thread, NULL, db_thread_func, NULL);
 
-    // Start HTTP thread
     pthread_t http_thread;
     pthread_create(&http_thread, NULL, http_thread_func, NULL);
 
-    // Start background layout thread if requested
     if (use_background_layout) {
         pthread_t layout_thread;
         pthread_create(&layout_thread, NULL, layout_thread_func, NULL);
         if (log_ui) printf("Background layout thread started\n");
     }
 
-    // Initialize Raylib window
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Graph Visualizer - Multi‑threaded");
     SetTargetFPS(FPS_TARGET);
 
@@ -1449,12 +1480,9 @@ int main(int argc, char **argv) {
     char search_text[64] = {0};
     Node *selected_node = NULL;
 
-    // Main loop
     while (!WindowShouldClose()) {
-        // Process UI messages (including position updates)
         process_ui_messages(ui_batch_size);
 
-        // --- Input Handling ---
         if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
             Vector2 delta = GetMouseDelta();
             camera.target.x -= delta.x / camera.zoom;
@@ -1511,13 +1539,11 @@ int main(int argc, char **argv) {
             selected_node = best;
         }
 
-        // Synchronous layout only if background layout is not active
         if (!use_background_layout && layout_enabled) {
             for (int i = 0; i < ITERATIONS_PER_FRAME; i++)
                 compute_layout_iteration(nodes_ui, edges_list_ui, edges_count_ui, use_spatial_accel, use_cage, use_collisions);
         }
 
-        // --- Drawing ---
         BeginDrawing();
         ClearBackground(SOLARIZED_BASE03);
         BeginMode2D(camera);
@@ -1557,7 +1583,6 @@ int main(int argc, char **argv) {
 
         EndMode2D();
 
-        // UI overlays
         DrawText(TextFormat("FPS: %d", GetFPS()), 10, 10, 20, WHITE);
         int y_off = 40;
         DrawText(TextFormat("Nodes: %d", HASH_COUNT(nodes_ui)), 10, y_off, 16, WHITE); y_off += 20;

@@ -2,9 +2,20 @@
 
 pkgs.mkShell {
   buildInputs = with pkgs; [
-    uv
-    python3
-    # Raylib dependencies (GLFW + X11)
+    # C compiler & build tools
+    gcc
+    clang
+    llvm
+    pkg-config
+
+    # Libraries
+    raylib          # graphics
+    sqlite          # database
+    libmicrohttpd   # HTTP server
+    cjson           # JSON parsing
+    uthash          # header‑only hash tables (uthash.h)
+
+    # Raylib runtime dependencies (already pulled by raylib, but we add them for LD_LIBRARY_PATH)
     glfw
     libGL
     xorg.libX11
@@ -12,12 +23,10 @@ pkgs.mkShell {
     xorg.libXi
     xorg.libXinerama
     xorg.libXcursor
-    alsa-lib          # for audio (optional)
-    pulseaudio        # optional, but avoids warnings
+    alsa-lib
+    pulseaudio
   ];
 
-  # Some Python packages (like raylib) need to find the libraries at runtime.
-  # NixOS uses rpath, but setting LD_LIBRARY_PATH can help for development.
   shellHook = ''
     export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [
       pkgs.glfw
@@ -28,7 +37,9 @@ pkgs.mkShell {
       pkgs.xorg.libXinerama
       pkgs.xorg.libXcursor
       pkgs.alsa-lib
-      pkgs.parallel
+      pkgs.pulseaudio
     ]}:$LD_LIBRARY_PATH
+    echo "C development environment ready."
+    echo "Compile with: gcc -o graphviz main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm"
   '';
 }

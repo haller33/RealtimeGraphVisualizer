@@ -1,1 +1,1 @@
-uv run --with raylib --with flask python main.py
+uv run --with raylib --with flask python app.py

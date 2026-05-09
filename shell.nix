@@ -38,6 +38,7 @@ pkgs.mkShell {
       pkgs.xorg.libXcursor
       pkgs.alsa-lib
       pkgs.pulseaudio
+      pkgs.graphviz
     ]}:$LD_LIBRARY_PATH
     echo "C development environment ready."
     echo "Compile with: gcc -o graphviz main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm"

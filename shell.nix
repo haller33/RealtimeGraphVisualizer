@@ -28,6 +28,7 @@ pkgs.mkShell {
       pkgs.xorg.libXinerama
       pkgs.xorg.libXcursor
       pkgs.alsa-lib
+      pkgs.parallel
     ]}:$LD_LIBRARY_PATH
   '';
 }

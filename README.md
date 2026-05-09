@@ -5,70 +5,74 @@
 [![Graphics](https://img.shields.io/badge/graphics-raylib-green.svg)](https://www.raylib.com/)
 [![Database](https://img.shields.io/badge/database-SQLite-blue.svg)](https://www.sqlite.org/)
 
-A high‑performance, real‑time graph visualizer with an interactive force‑directed layout, an HTTP API, and persistent storage. This C implementation is the main version, fully rewritten from an earlier Python prototype for better speed and lower resource usage.
+A high‑performance, real‑time graph visualizer with multiple layout engines, an HTTP API, and persistent storage. **This C implementation is the main version** – fully rewritten from an earlier Python prototype for better speed and lower resource usage.
 
 ![Good View](blob/good_view.jpg)
 *Interactive graph layout with tag search, collision handling, and an “infinite canvas” mode.*
 
-## ✨ Features
-
-* **Multiple Layouts** – Choose between force‑directed (real‑time physical simulation), depth‑based tree layout, and simple grid layout.
-* **Interactive UI** – Pan, zoom, select nodes, and search by tags.
-* **Toggleable Options** – Layout animation, collision resolution, and infinite canvas (cage) mode.
-* **HTTP API** – RESTful endpoints to manage nodes, edges, and tags dynamically.
-* **Persistent Storage** – SQLite (in‑memory by default, easily switched to a file).
-* **Multi‑threaded** – HTTP server runs on a separate thread; graph updates are queued and applied safely.
-* **Node Metadata** – Store arbitrary JSON metadata per node.
-* **Offline Layout** – A Python script runs Graphviz layout engines (`sfdp`, `neato`, `dot`) offline and updates the database.
-* **Real‑time Updates** – Add, delete, or modify elements via the API while the visualisation runs.
-* **Background Layout Thread** – Offload layout computations to a background thread, keeping the UI responsive for large graphs.
-
 ## 📸 Screenshots
 
-| Simple example showing many nodes | Node detail panel and search |
-|-----------------------------------|------------------------------|
-| ![Simple Example](blob/simple_example.jpg) | ![Node panel](blob/good_view.jpg) |
+| Force‑directed layout (organic) | Tree layout | Grid layout |
+|--------------------------------|-------------|--------------|
+| ![Organic](blob/larg_organic.jpg)   | ![Tree](blob/offline_pre_processing.jpg) | ![Grid](blob/simple_example.jpg) |
+
+| Large graph via API | Node detail and search | Offline preprocessing |
+|--------------------|------------------------|----------------------|
+| ![API Insert](blob/large_api_insert.png) | ![Good view](blob/good_view.jpg) | ![Offline](blob/offline_pre_processing.jpg) |
+
+*From left to right: organic force‑directed layout, hierarchical tree layout, grid layout; API insertion with many nodes, node detail panel, offline layout via Graphviz.*
+
+## ✨ Features
+
+- **Multiple Layouts** – choose between:
+  - **Force‑directed** – real‑time physical simulation (repulsion, attraction, damping) with optional grid acceleration (`--spatial`).
+  - **Tree layout** – depth‑based hierarchical placement, perfect for trees and DAGs (instant, O(N log N)).
+  - **Grid layout** – simple alphabetical grid (instant, O(N log N)).
+- **Interactive UI** – pan (right mouse), zoom (scroll), select nodes (left click), search by tag (`S`).
+- **Toggleable Options** – layout animation (`L`), collision resolution (`X`), infinite canvas / cage mode (`C`).
+- **HTTP API** – RESTful endpoints to manage nodes, edges, and tags dynamically.
+- **Persistent Storage** – SQLite (in‑memory by default, file‑based with `--db` flag).
+- **Multi‑threaded Architecture** – HTTP, database, and (optionally) layout run in separate threads.
+- **Background Layout Thread** – offload force layout to a background thread (`--background-layout`); UI stays responsive even for large graphs.
+- **Offline Layout** – Python script (`offline_layout_sqlite.py`) uses Graphviz engines (`sfdp`, `neato`, `dot`) to compute high‑quality positions and updates the database.
+- **Node Metadata** – store arbitrary JSON metadata per node.
+- **Tag Search** – highlight nodes by tag.
 
 ## 🚀 Getting Started
 
 ### Dependencies
 
-Ensure the following libraries are installed:
+Install the required libraries:
 
-* [raylib](https://www.raylib.com/) – graphics and input handling
-* [SQLite3](https://www.sqlite.org/) – node/edge/tag storage
-* [libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/) – HTTP server
-* [cJSON](https://github.com/DaveGamble/cJSON) – JSON parsing
-* [uthash](https://troydhanson.github.io/uthash/) – hash tables (header‑only)
-* [pthreads](https://en.wikipedia.org/wiki/Pthreads) – threading support
+- [raylib](https://www.raylib.com/) – graphics
+- [SQLite3](https://www.sqlite.org/) – database
+- [libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/) – HTTP server
+- [cJSON](https://github.com/DaveGamble/cJSON) – JSON parsing
+- [uthash](https://troydhanson.github.io/uthash/) – hash tables (header‑only)
+- pthreads – threading
 
-For offline layout, you also need **Graphviz**:
-
+For offline layout, also install **Graphviz**:
 ```bash
-# On Debian/Ubuntu
+# Debian/Ubuntu
 sudo apt install graphviz
 
-# On macOS
+# macOS
 brew install graphviz
-
-# On NixOS/nix
-nix-shell -p graphviz
 ```
 
-On **NixOS** or with **nix**, you can use the provided `shell.nix` to get all dependencies:
+On **NixOS** or with **nix**, use the provided `shell.nix`:
 ```bash
 nix-shell
 ```
 
 ### Build
 
-The project includes a simple `build.sh` script:
 ```bash
 chmod +x build.sh
 ./build.sh
 ```
 
-Or compile manually (example with `gcc`):
+Or manually:
 ```bash
 gcc -o graph_visualizer main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm
 ```
@@ -79,24 +83,31 @@ gcc -o graph_visualizer main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread
 ./graph_visualizer
 ```
 
-The visualisation window will open. The HTTP server starts automatically on port `5000` by default. You can specify a persistent database file using the `--db` flag:
+Use command‑line flags to customise:
 ```bash
+# Use a file‑based database
 ./graph_visualizer --db graph.db
+
+# Enable spatial acceleration and background layout
+./graph_visualizer --spatial --background-layout
+
+# Use tree layout (disables dynamic layout)
+./graph_visualizer --layout-mode=tree
+
+# Grid layout
+./graph_visualizer --layout-mode=grid
 ```
 
 ### Command‑Line Options
 
-```
---db <file>               Use a file‑based SQLite database instead of in‑memory.
---spatial                 Enable grid‑based spatial acceleration for force layout.
---background-layout       Run force layout in a background thread.
---layout-mode=force|tree|grid
-                          Select layout algorithm.
---log-http                Log HTTP requests.
---log-db                  Log database operations.
---log-ui                  Log UI messages.
---ui-batch-size N         Process UI messages in batches (default 5).
-```
+| Flag | Description |
+|------|-------------|
+| `--db <file>` | Use a file‑based SQLite database (default: in‑memory). |
+| `--spatial` | Enable grid‑based spatial acceleration for force layout. |
+| `--background-layout` | Run force layout in a background thread (keeps UI smooth). |
+| `--layout-mode=force|tree|grid` | Select layout algorithm (default: force). |
+| `--log-http`, `--log-db`, `--log-ui` | Enable logging for the respective component. |
+| `--ui-batch-size N` | Process UI messages in batches (default 5). |
 
 ## 🎮 Keyboard & Mouse Controls
 
@@ -105,7 +116,7 @@ The visualisation window will open. The HTTP server starts automatically on port
 | **Pan**              | Right mouse button + drag        |
 | **Zoom**             | Mouse wheel                      |
 | **Reset camera**     | `R`                              |
-| **Toggle layout**    | `L`                              |
+| **Toggle layout**    | `L` (force mode only)            |
 | **Toggle cage mode** | `C` (bounding box vs. infinite)  |
 | **Toggle collisions**| `X`                              |
 | **Search by tag**    | `S` (then type, press Enter)     |
@@ -116,7 +127,7 @@ The visualisation window will open. The HTTP server starts automatically on port
 
 ## 🌐 HTTP API
 
-The server listens on `http://localhost:5000`. All endpoints expect and return JSON.
+The server runs on `http://localhost:5000`. All endpoints expect and return JSON.
 
 ### Nodes
 
@@ -126,7 +137,7 @@ The server listens on `http://localhost:5000`. All endpoints expect and return J
 | `GET`  | `/nodes`       | List all nodes (filter by `?tag=`) |
 | `DELETE` | `/nodes/{id}` | Delete a node and its edges      |
 
-**POST /nodes** example payload:
+**POST /nodes** example:
 ```json
 {
   "id": "node123",
@@ -142,7 +153,7 @@ The server listens on `http://localhost:5000`. All endpoints expect and return J
 
 | Method | Endpoint                     | Description                 |
 |--------|------------------------------|-----------------------------|
-| `POST` | `/edges`                     | Create an edge between two nodes |
+| `POST` | `/edges`                     | Create an edge              |
 | `DELETE` | `/edges?source=A&target=B` | Delete a specific edge       |
 
 **POST /edges** payload:
@@ -174,7 +185,7 @@ The server listens on `http://localhost:5000`. All endpoints expect and return J
 
 ## 🗄️ Offline Layout with Graphviz
 
-The `offline_layout_sqlite.py` script lets you compute high‑quality node positions using Graphviz and update the database without any runtime overhead.
+The `offline_layout_sqlite.py` script uses Graphviz to compute high‑quality node positions offline, then updates the database.
 
 ### Usage
 
@@ -183,58 +194,54 @@ python3 offline_layout_sqlite.py --db graph.db --mode sfdp [--output new.db]
 ```
 
 Options:
-* `--mode {sfdp,neato,dot}` – Graphviz layout engine (default: `sfdp`).
-  * `sfdp` – scalable force‑directed, best for large graphs.
-  * `neato` – suitable for moderate‑sized graphs.
-  * `dot` – hierarchical layout, ideal for directed trees.
-* `--db <file>` – input SQLite database file.
-* `--output <file>` – output SQLite file (if not given, overwrites input).
+- `--mode {sfdp,neato,dot}` – layout engine (sfdp for large graphs, neato for medium, dot for hierarchies).
+- `--db` – input SQLite database file.
+- `--output` – output file (if omitted, overwrites input).
 
-### How it works
-
-1. Reads the graph (nodes, edges) from the SQLite database.
-2. Converts the graph to DOT format with proper quoting.
-3. Runs the chosen Graphviz engine with JSON output.
-4. Parses the JSON, extracts node coordinates, and flips the Y axis (because Graphviz uses bottom‑left origin while the visualizer uses top‑left).
-5. Updates the `nodes` table in the database with the new positions.
-
-### Example workflow
+### Example
 
 ```bash
-# Start the visualizer with a persistent database
+# Start visualizer with persistent database
 ./graph_visualizer --db graph.db
 
-# Populate the graph via API (or load initial data)
+# Populate graph via API (or load sample data)
 
-# Stop the visualizer (or leave it running; the database will be updated on disk)
+# Stop visualizer (or leave it running; changes are saved to disk)
 
 # Run offline layout
 python3 offline_layout_sqlite.py --db graph.db --mode sfdp
 
-# Restart the visualizer to see the new positions
+# Restart visualizer to see new positions
 ./graph_visualizer --db graph.db
 ```
 
+The script extracts the graph, runs Graphviz, parses JSON output, flips Y‑axis coordinates, and updates the `nodes` table.
+
 ## 🧠 Architecture
 
-* **Main thread** – runs the raylib graphics loop, processes user input, and updates the force layout.
-* **HTTP thread** – runs libmicrohttpd, parses JSON, and pushes messages into a thread‑safe queue.
-* **Database thread** – processes tasks (add/delete nodes/edges/tags) using a single persistent SQLite connection.
-* **Layout thread** (optional) – runs force layout on a separate copy of the graph and sends batched position updates to the UI queue.
-* **Message queues** – holds `ADD_NODE`, `ADD_EDGE`, `DELETE_NODE`, etc. messages to avoid concurrent modification of the graph data.
-* **Double‑buffered graph** – when background layout is enabled, the UI and layout threads work on independent copies, swapped via queue messages.
-* **In‑memory structures** – nodes stored with uthash hash tables; edges stored in a hash set and a linear array for fast iteration.
+- **Main thread** – raylib graphics loop, input handling, drawing.
+- **HTTP thread** – libmicrohttpd server, parses JSON, pushes tasks to a message queue.
+- **Database thread** – consumes tasks, uses a persistent SQLite connection.
+- **Layout thread** (optional) – runs force layout on a separate graph copy and sends batched position updates to the UI queue.
+- **Double‑buffered graph** – when background layout is enabled, the UI and layout threads work on independent copies, swapped via queue messages, eliminating locks and flicker.
+- **Message queues** – thread‑safe queues (add node, add edge, position updates, etc.).
+- **Data structures** – uthash for hash tables (nodes, edges, tags), linear arrays for edge lists.
 
 ## 📁 Project Structure
 
 ```
 .
-├── main.c                    – Single‑file implementation
-├── offline_layout_sqlite.py – Python script for Graphviz offline layout
-├── build.sh                  – Quick build script
-├── shell.nix                 – Nix development environment
-├── blob/                     – Screenshot images
-└── README.md                 – This file
+├── main.c                       – Single‑file C implementation
+├── offline_layout_sqlite.py     – Python script for Graphviz offline layout
+├── build.sh                     – Build script
+├── shell.nix                    – Nix environment
+├── blob/                        – Screenshot images
+│   ├── good_view.jpg
+│   ├── large_api_insert.png
+│   ├── larg_organic.jpg
+│   ├── offline_pre_processing.jpg
+│   └── simple_example.jpg
+└── README.md                    – This file
 ```
 
 ## 🤝 Contributing
@@ -247,12 +254,12 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 
 ## 🙏 Acknowledgements
 
-* [Raylib](https://www.raylib.com/) – simple and powerful graphics library.
-* [cJSON](https://github.com/DaveGamble/cJSON) – lightweight JSON parser.
-* [libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/) – embedded HTTP server.
-* [uthash](https://troydhanson.github.io/uthash/) – convenient hash table macros.
-* [Graphviz](https://graphviz.org/) – high‑quality graph layout engines.
-* The original Python prototype – inspiration for the features.
+- [Raylib](https://www.raylib.com/)
+- [cJSON](https://github.com/DaveGamble/cJSON)
+- [libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/)
+- [uthash](https://troydhanson.github.io/uthash/)
+- [Graphviz](https://graphviz.org/)
+- The original Python prototype
 
 ---
 

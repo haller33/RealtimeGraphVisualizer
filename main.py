@@ -45,6 +45,7 @@ TEXT_COLOR = pr.BLACK
 # UI_BG_COLOR = pr.Fade(pr.BLACK, 0.78)
 UI_BG_COLOR = pr.Color(30, 30, 40, 200)   # RGBA: near black, ~78% opacity
 faded_white = pr.Color(245, 245, 245, 128)   # RAYWHITE values + 50% alpha
+SOLARIZED_BASE03 = pr.Color(0, 43, 54)   # Solarized base03
 
 # ----------------------------- Database Setup --------------------------------
 DB_URI = "file::memory:?cache=shared"
@@ -408,7 +409,7 @@ def main():
 
         # ----- Drawing -----
         pr.begin_drawing()
-        pr.clear_background(pr.DARKGRAY)
+        pr.clear_background(SOLARIZED_BASE03)
         pr.begin_mode_2d(camera)
 
         # Draw edges

@@ -11,7 +11,7 @@
 #include <microhttpd.h>
 #include <cjson/cJSON.h>
 #include <uthash.h>
-#include "raylib.h"    // <-- Add this line back
+#include "raylib.h"
 
 // ----------------------------- Configuration ---------------------------------
 #define WINDOW_WIDTH  1280
@@ -35,6 +35,11 @@
 #define SELECTED_NODE_COLOR     GOLD
 #define UI_BG_COLOR             (Color){30, 30, 40, 200}
 #define SOLARIZED_BASE03        (Color){0, 43, 54}
+
+// Global UI Flags
+bool layout_enabled = true;
+bool use_cage = false;        // Infinity canvas by default
+bool use_collisions = true;
 
 // ----------------------------- Uthash structures ----------------------------
 typedef struct Node {
@@ -457,10 +462,16 @@ void update_layout(void) {
         n1->y += fy * TIME_STEP;
         n1->fx *= DAMPING;
         n1->fy *= DAMPING;
-        n1->x = fmaxf(50.0f, fminf(WINDOW_WIDTH - 50.0f, n1->x));
-        n1->y = fmaxf(50.0f, fminf(WINDOW_HEIGHT - 50.0f, n1->y));
+
+        // Toggleable Cage
+        if (use_cage) {
+            n1->x = fmaxf(50.0f, fminf(WINDOW_WIDTH - 50.0f, n1->x));
+            n1->y = fmaxf(50.0f, fminf(WINDOW_HEIGHT - 50.0f, n1->y));
+        }
     }
-    resolve_collisions();
+    
+    // Toggleable Collisions
+    if (use_collisions) resolve_collisions();
 }
 
 // ----------------------------- HTTP Server ----------------------------------
@@ -513,7 +524,7 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
 
         char *post = state->payload ? state->payload : strdup("");
         cJSON *json = cJSON_Parse(post);
-        if (state->payload == NULL) free(post); // Free if it was strdup'd
+        if (state->payload == NULL) free(post); 
 
         if (!json) return send_json_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
 
@@ -539,8 +550,9 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
                 }
             }
 
-            float x = (float)(rand() % (WINDOW_WIDTH - 400) + 200);
-            float y = (float)(rand() % (WINDOW_HEIGHT - 400) + 200);
+            // Centralized Spawning (better for infinity canvas)
+            float x = (float)((rand() % 1000) - 500);
+            float y = (float)((rand() % 1000) - 500);
             db_insert_node(id_str, label_str, x, y, meta_str);
             for (int i=0; i<actual_tag_cnt; i++) db_insert_tag(id_str, tag_arr[i]);
 
@@ -719,9 +731,10 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
 
 void* run_http_server(void *arg) {
     (void)arg;
-    http_daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, 5000, NULL, NULL, &handle_request, NULL, 
+    // Updated port to 5000 to resolve binding conflicts
+    http_daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, 5000, NULL, NULL, &handle_request, NULL, 
                                    MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL, MHD_OPTION_END);
-    if (!http_daemon) { fprintf(stderr, "Failed to start HTTP server\n"); exit(1); }
+    if (!http_daemon) { fprintf(stderr, "Failed to start HTTP server on 5000\n"); exit(1); }
     printf("API server running on http://localhost:5000\n");
     while (1) sleep(1);
     return NULL;
@@ -742,7 +755,6 @@ int main(void) {
     camera.target = (Vector2){ 0, 0 };
     camera.zoom = 1.0f;
 
-    bool layout_enabled = true;
     bool search_active = false;
     char search_text[64] = {0};
     Node *selected_node = NULL;
@@ -767,8 +779,8 @@ int main(void) {
                         }
                         free(copy);
                     }
-                    float x = (float)(rand() % (WINDOW_WIDTH-400) + 200);
-                    float y = (float)(rand() % (WINDOW_HEIGHT-400) + 200);
+                    float x = (float)((rand() % 1000) - 500);
+                    float y = (float)((rand() % 1000) - 500);
                     mem_add_node(msg->id1, msg->id2, x, y, msg->metadata, tags, tag_cnt);
                     for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
                     free(tags);
@@ -806,7 +818,7 @@ int main(void) {
             free(msg);
         }
 
-        // Input
+        // --- Input Handling ---
         if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
             Vector2 delta = GetMouseDelta();
             camera.target.x -= delta.x / camera.zoom;
@@ -815,8 +827,8 @@ int main(void) {
         float scroll = GetMouseWheelMove();
         if (scroll != 0) {
             camera.zoom += scroll * 0.1f;
-            if (camera.zoom < 0.2f) camera.zoom = 0.2f;
-            if (camera.zoom > 3.0f) camera.zoom = 3.0f;
+            if (camera.zoom < 0.1f) camera.zoom = 0.1f;
+            if (camera.zoom > 5.0f) camera.zoom = 5.0f;
         }
         if (IsKeyPressed(KEY_R)) {
             if (HASH_COUNT(nodes) > 0) {
@@ -828,7 +840,12 @@ int main(void) {
             } else camera.target = (Vector2){ 0, 0 };
             camera.zoom = 1.0f;
         }
+
+        // UI Toggles via Keyboard
         if (IsKeyPressed(KEY_L)) layout_enabled = !layout_enabled;
+        if (IsKeyPressed(KEY_C)) use_cage = !use_cage;
+        if (IsKeyPressed(KEY_X)) use_collisions = !use_collisions;
+
         if (IsKeyPressed(KEY_S)) {
             search_active = !search_active;
             memset(search_text, 0, sizeof(search_text));
@@ -864,6 +881,7 @@ int main(void) {
         for (int i = 0; i < ITERATIONS_PER_FRAME && layout_enabled; i++)
             update_layout();
 
+        // --- Drawing ---
         BeginDrawing();
         ClearBackground(SOLARIZED_BASE03);
         BeginMode2D(camera);
@@ -903,17 +921,24 @@ int main(void) {
 
         EndMode2D();
 
+        // --- UI Overlays ---
         DrawText(TextFormat("FPS: %d", GetFPS()), 10, 10, 20, WHITE);
-        DrawText(layout_enabled ? "Layout ON" : "Layout OFF", 10, 40, 16, layout_enabled ? LIME : RED);
-        DrawText("[L] Layout | [S] Search tags | [R] Reset cam | Middle drag | Scroll zoom", 10, WINDOW_HEIGHT-30, 16, WHITE);
+        
+        // Status Indicators
+        int y_off = 40;
+        DrawText(layout_enabled ? "[L] Layout: ON" : "[L] Layout: OFF", 10, y_off, 16, layout_enabled ? LIME : RED); y_off += 20;
+        DrawText(use_cage ? "[C] Cage: ON" : "[C] Cage: OFF (Infinity)", 10, y_off, 16, use_cage ? LIME : SKYBLUE); y_off += 20;
+        DrawText(use_collisions ? "[X] Collisions: ON" : "[X] Collisions: OFF", 10, y_off, 16, use_collisions ? LIME : ORANGE);
+
+        DrawText("[S] Search | [R] Reset Camera | Middle-Mouse: Pan | Scroll: Zoom", 10, WINDOW_HEIGHT-30, 16, LIGHTGRAY);
 
         if (search_active) {
-            Rectangle bar = { 10, 70, 300, 30 };
+            Rectangle bar = { 10, 140, 300, 30 };
             DrawRectangleRec(bar, UI_BG_COLOR);
             DrawRectangleLines(bar.x, bar.y, bar.width, bar.height, WHITE);
             char prompt[128];
             snprintf(prompt, sizeof(prompt), "Search tag: %s_", search_text);
-            DrawText(prompt, 15, 75, 20, WHITE);
+            DrawText(prompt, 15, 145, 20, WHITE);
         }
 
         if (selected_node) {

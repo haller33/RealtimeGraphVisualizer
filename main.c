@@ -10,8 +10,8 @@
 #include <sqlite3.h>
 #include <microhttpd.h>
 #include <cjson/cJSON.h>
-#include <uthash.h>          // ← critical missing include
-#include "raylib.h"
+#include <uthash.h>
+#include "raylib.h"    // <-- Add this line back
 
 // ----------------------------- Configuration ---------------------------------
 #define WINDOW_WIDTH  1280
@@ -63,12 +63,10 @@ typedef struct NodeTags {
     UT_hash_handle hh;
 } NodeTags;
 
-// Global hash tables
 Node *nodes = NULL;
 EdgeSet *edges_set = NULL;
 NodeTags *tags_hash = NULL;
 
-// Dynamic edge list for iteration
 typedef struct Edge {
     char src[64];
     char tgt[64];
@@ -130,11 +128,13 @@ QueueMsg* dequeue_msg_nonblock(void) {
 sqlite3* get_db_conn(void) {
     sqlite3 *conn;
     sqlite3_open(DB_URI, &conn);
+    sqlite3_exec(conn, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
     return conn;
 }
 
 void init_database(void) {
     sqlite3_open(DB_URI, &db);
+    sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
     const char *sql =
         "CREATE TABLE IF NOT EXISTS nodes ("
         "  id TEXT PRIMARY KEY,"
@@ -216,11 +216,13 @@ void db_delete_edge(const char *src, const char *tgt) {
     sqlite3_close(conn);
 }
 
-// ----------------------------- In‑memory helpers ----------------------------
+// ----------------------------- In-memory helpers ----------------------------
 void mem_add_node(const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count) {
     Node *node = malloc(sizeof(Node));
     strncpy(node->id, id, sizeof(node->id)-1);
+    node->id[sizeof(node->id)-1] = '\0';
     strncpy(node->label, label, sizeof(node->label)-1);
+    node->label[sizeof(node->label)-1] = '\0';
     node->x = x; node->y = y;
     node->fx = node->fy = 0.0f;
     node->metadata = malloc(strlen(metadata)+1);
@@ -232,6 +234,7 @@ void mem_add_node(const char *id, const char *label, float x, float y, const cha
     if (!nt) {
         nt = malloc(sizeof(NodeTags));
         strncpy(nt->node_id, id, sizeof(nt->node_id)-1);
+        nt->node_id[sizeof(nt->node_id)-1] = '\0';
         nt->tags.count = 0;
         nt->tags.capacity = 4;
         nt->tags.tags = malloc(nt->tags.capacity * sizeof(char*));
@@ -257,6 +260,7 @@ void mem_add_edge(const char *src, const char *tgt) {
         edges_capacity = edges_capacity ? edges_capacity*2 : 16;
         edges_list = realloc(edges_list, edges_capacity * sizeof(Edge));
     }
+    memset(&edges_list[edges_count], 0, sizeof(Edge));
     strncpy(edges_list[edges_count].src, src, sizeof(edges_list[edges_count].src)-1);
     strncpy(edges_list[edges_count].tgt, tgt, sizeof(edges_list[edges_count].tgt)-1);
     edges_count++;
@@ -268,6 +272,7 @@ void mem_add_tags(const char *node_id, const char **tags, int tag_count) {
     if (!nt) {
         nt = malloc(sizeof(NodeTags));
         strncpy(nt->node_id, node_id, sizeof(nt->node_id)-1);
+        nt->node_id[sizeof(nt->node_id)-1] = '\0';
         nt->tags.count = 0;
         nt->tags.capacity = 4;
         nt->tags.tags = malloc(nt->tags.capacity * sizeof(char*));
@@ -295,6 +300,7 @@ void rebuild_edge_list(void) {
             edges_capacity = edges_capacity ? edges_capacity*2 : 16;
             edges_list = realloc(edges_list, edges_capacity * sizeof(Edge));
         }
+        memset(&edges_list[edges_count], 0, sizeof(Edge));
         sscanf(e->key, "%[^|]|%[^|]", edges_list[edges_count].src, edges_list[edges_count].tgt);
         edges_count++;
     }
@@ -460,6 +466,11 @@ void update_layout(void) {
 // ----------------------------- HTTP Server ----------------------------------
 static struct MHD_Daemon *http_daemon = NULL;
 
+typedef struct {
+    char *payload;
+    size_t size;
+} ReqState;
+
 enum MHD_Result send_json_response(struct MHD_Connection *connection, int status_code, const char *json_str) {
     struct MHD_Response *resp = MHD_create_response_from_buffer(strlen(json_str), (void*)json_str, MHD_RESPMEM_MUST_COPY);
     MHD_add_response_header(resp, "Content-Type", "application/json");
@@ -468,70 +479,96 @@ enum MHD_Result send_json_response(struct MHD_Connection *connection, int status
     return ret;
 }
 
-char* get_post_data(struct MHD_Connection *connection) {
-    const char *encoding = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Type");
-    if (!encoding || strcmp(encoding, "application/json") != 0) return NULL;
-    return strdup(MHD_lookup_connection_value(connection, MHD_POSTDATA_KIND, "") ?: "");
+static void request_completed(void *cls, struct MHD_Connection *connection,
+                              void **con_cls, enum MHD_RequestTerminationCode toe) {
+    if (*con_cls) {
+        ReqState *state = (ReqState *)*con_cls;
+        if (state->payload) free(state->payload);
+        free(state);
+        *con_cls = NULL;
+    }
 }
 
 enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
                                const char *url, const char *method,
                                const char *version, const char *upload_data,
                                size_t *upload_data_size, void **con_cls) {
-    (void)cls; (void)version; (void)upload_data; (void)upload_data_size; (void)con_cls;
+    (void)cls; (void)version;
+
     if (strcmp(method, "POST") == 0) {
+        ReqState *state = (ReqState *)*con_cls;
+        if (!state) {
+            state = calloc(1, sizeof(ReqState));
+            *con_cls = state;
+            return MHD_YES;
+        }
+        if (*upload_data_size > 0) {
+            state->payload = realloc(state->payload, state->size + *upload_data_size + 1);
+            memcpy(state->payload + state->size, upload_data, *upload_data_size);
+            state->size += *upload_data_size;
+            state->payload[state->size] = '\0';
+            *upload_data_size = 0;
+            return MHD_YES;
+        }
+
+        char *post = state->payload ? state->payload : strdup("");
+        cJSON *json = cJSON_Parse(post);
+        if (state->payload == NULL) free(post); // Free if it was strdup'd
+
+        if (!json) return send_json_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
+
         if (strcmp(url, "/nodes") == 0) {
-            char *post = get_post_data(connection);
-            if (!post) return MHD_NO;
-            cJSON *json = cJSON_Parse(post);
-            free(post);
-            if (!json) return send_json_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
             cJSON *id = cJSON_GetObjectItem(json, "id");
             if (!cJSON_IsString(id)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing id\"}"); }
             const char *id_str = id->valuestring;
             cJSON *label = cJSON_GetObjectItem(json, "label");
-            const char *label_str = label ? label->valuestring : id_str;
+            const char *label_str = (label && cJSON_IsString(label)) ? label->valuestring : id_str;
             cJSON *metadata = cJSON_GetObjectItem(json, "metadata");
             char *meta_str = metadata ? cJSON_PrintUnformatted(metadata) : strdup("{}");
+
             cJSON *tags = cJSON_GetObjectItem(json, "tags");
-            int tag_cnt = 0;
+            int actual_tag_cnt = 0;
             const char **tag_arr = NULL;
+
             if (cJSON_IsArray(tags)) {
-                tag_cnt = cJSON_GetArraySize(tags);
-                tag_arr = malloc(tag_cnt * sizeof(const char*));
-                for (int i = 0; i < tag_cnt; i++) {
+                int total_cnt = cJSON_GetArraySize(tags);
+                tag_arr = malloc(total_cnt * sizeof(const char*));
+                for (int i = 0; i < total_cnt; i++) {
                     cJSON *t = cJSON_GetArrayItem(tags, i);
-                    if (cJSON_IsString(t)) tag_arr[i] = t->valuestring;
+                    if (cJSON_IsString(t)) tag_arr[actual_tag_cnt++] = t->valuestring;
                 }
             }
+
             float x = (float)(rand() % (WINDOW_WIDTH - 400) + 200);
             float y = (float)(rand() % (WINDOW_HEIGHT - 400) + 200);
             db_insert_node(id_str, label_str, x, y, meta_str);
-            for (int i=0; i<tag_cnt; i++) db_insert_tag(id_str, tag_arr[i]);
+            for (int i=0; i<actual_tag_cnt; i++) db_insert_tag(id_str, tag_arr[i]);
+
             QueueMsg *msg = calloc(1, sizeof(QueueMsg));
             msg->type = MSG_ADD_NODE;
             strncpy(msg->id1, id_str, sizeof(msg->id1)-1);
             strncpy(msg->id2, label_str, sizeof(msg->id2)-1);
             msg->metadata = meta_str;
-            if (tag_cnt > 0) {
-                char tags_buf[512] = {0};
-                for (int i=0; i<tag_cnt; i++) {
+
+            if (actual_tag_cnt > 0) {
+                size_t buf_len = 1;
+                for(int i=0; i<actual_tag_cnt; i++) buf_len += strlen(tag_arr[i]) + 1;
+                char *tags_buf = calloc(1, buf_len);
+                for (int i=0; i<actual_tag_cnt; i++) {
                     strcat(tags_buf, tag_arr[i]);
-                    if (i<tag_cnt-1) strcat(tags_buf, ",");
+                    if (i<actual_tag_cnt-1) strcat(tags_buf, ",");
                 }
-                msg->tags_str = strdup(tags_buf);
-            } else msg->tags_str = strdup("");
+                msg->tags_str = tags_buf;
+            } else {
+                msg->tags_str = strdup("");
+            }
+
             enqueue_msg(msg);
-            free(tag_arr);
+            free((void*)tag_arr);
             cJSON_Delete(json);
             return send_json_response(connection, 201, "{\"status\":\"ok\"}");
         }
         else if (strcmp(url, "/edges") == 0) {
-            char *post = get_post_data(connection);
-            if (!post) return MHD_NO;
-            cJSON *json = cJSON_Parse(post);
-            free(post);
-            if (!json) return send_json_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
             cJSON *src = cJSON_GetObjectItem(json, "source");
             cJSON *tgt = cJSON_GetObjectItem(json, "target");
             if (!cJSON_IsString(src) || !cJSON_IsString(tgt)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing source/target\"}"); }
@@ -547,36 +584,41 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
         else if (strncmp(url, "/nodes/", 7) == 0 && strstr(url, "/tags")) {
             char node_id[64] = {0};
             sscanf(url, "/nodes/%63[^/]/tags", node_id);
-            char *post = get_post_data(connection);
-            if (!post) return MHD_NO;
-            cJSON *json = cJSON_Parse(post);
-            free(post);
-            if (!json) return send_json_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
             cJSON *tags = cJSON_GetObjectItem(json, "tags");
             if (!cJSON_IsArray(tags)) { cJSON_Delete(json); return send_json_response(connection, 400, "{\"error\":\"Missing tags array\"}"); }
-            int tag_cnt = cJSON_GetArraySize(tags);
-            const char **tag_arr = malloc(tag_cnt * sizeof(const char*));
-            for (int i=0; i<tag_cnt; i++) {
+
+            int total_cnt = cJSON_GetArraySize(tags);
+            const char **tag_arr = malloc(total_cnt * sizeof(const char*));
+            int actual_tag_cnt = 0;
+            for (int i=0; i<total_cnt; i++) {
                 cJSON *t = cJSON_GetArrayItem(tags, i);
                 if (cJSON_IsString(t)) {
-                    tag_arr[i] = t->valuestring;
+                    tag_arr[actual_tag_cnt++] = t->valuestring;
                     db_insert_tag(node_id, t->valuestring);
                 }
             }
+
             QueueMsg *msg = calloc(1, sizeof(QueueMsg));
             msg->type = MSG_ADD_TAGS;
             strncpy(msg->id1, node_id, sizeof(msg->id1)-1);
-            char tags_buf[512] = {0};
-            for (int i=0; i<tag_cnt; i++) {
+            
+            size_t buf_len = 1;
+            for(int i=0; i<actual_tag_cnt; i++) buf_len += strlen(tag_arr[i]) + 1;
+            char *tags_buf = calloc(1, buf_len);
+            for (int i=0; i<actual_tag_cnt; i++) {
                 strcat(tags_buf, tag_arr[i]);
-                if (i<tag_cnt-1) strcat(tags_buf, ",");
+                if (i<actual_tag_cnt-1) strcat(tags_buf, ",");
             }
-            msg->tags_str = strdup(tags_buf);
+            msg->tags_str = tags_buf;
+
             enqueue_msg(msg);
-            free(tag_arr);
+            free((void*)tag_arr);
             cJSON_Delete(json);
             return send_json_response(connection, 200, "{\"status\":\"ok\"}");
         }
+
+        cJSON_Delete(json);
+        return MHD_NO;
     }
     else if (strcmp(method, "GET") == 0) {
         if (strcmp(url, "/nodes") == 0) {
@@ -677,7 +719,8 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
 
 void* run_http_server(void *arg) {
     (void)arg;
-    http_daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, 5000, NULL, NULL, &handle_request, NULL, MHD_OPTION_END);
+    http_daemon = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, 5000, NULL, NULL, &handle_request, NULL, 
+                                   MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL, MHD_OPTION_END);
     if (!http_daemon) { fprintf(stderr, "Failed to start HTTP server\n"); exit(1); }
     printf("API server running on http://localhost:5000\n");
     while (1) sleep(1);

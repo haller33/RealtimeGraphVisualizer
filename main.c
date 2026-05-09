@@ -1,5 +1,7 @@
 // main.c – Graph Visualizer with Raylib + HTTP API + SQLite (C version)
-// Multi‑threaded version: HTTP thread, DB thread, UI thread.
+// Multi‑threaded version with optional spatial acceleration (grid) and right‑click pan.
+// Compile: gcc -o graph_visualizer main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm
+// Usage: ./graph_visualizer [--spatial] [--log-http] [--log-db] [--log-ui] [--ui-batch-size N]
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,15 +16,16 @@
 #include <microhttpd.h>
 #include <cjson/cJSON.h>
 #include <uthash.h>
+#include <float.h>
 #include "raylib.h"
 
 // ----------------------------- Configuration ---------------------------------
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 #define FPS_TARGET    60
-#define DEFAULT_UI_BATCH_SIZE 5   // process at most 5 UI messages per frame
+#define DEFAULT_UI_BATCH_SIZE 5
 
-// Force layout parameters (unchanged)
+// Force layout parameters
 #define REPULSION_STRENGTH      2500.0f
 #define ATTRACTION_STRENGTH     0.005f
 #define DESIRED_EDGE_LENGTH     150.0f
@@ -30,6 +33,9 @@
 #define ITERATIONS_PER_FRAME    5
 #define MAX_FORCE               30.0f
 #define TIME_STEP               0.1f
+
+// Grid acceleration
+#define CELL_SIZE               (DESIRED_EDGE_LENGTH * 2.0f)  // 300.0f
 
 #define NODE_RADIUS             12
 #define SELECTED_NODE_RADIUS    16
@@ -45,6 +51,7 @@
 bool layout_enabled = true;
 bool use_cage = false;
 bool use_collisions = true;
+bool use_spatial_accel = false;   // NEW: spatial acceleration flag
 
 // ----------------------------- Logging flags ---------------------------------
 bool log_http = false;
@@ -101,7 +108,7 @@ int edges_capacity = 0;
 
 // ----------------------------- Database & persistent storage -----------------
 static const char *DB_URI = "file::memory:?cache=shared";
-sqlite3 *db = NULL;                // used only for initial load and by DB thread
+sqlite3 *db = NULL;
 
 // ----------------------------- Task queue for DB operations -----------------
 typedef enum {
@@ -114,10 +121,10 @@ typedef enum {
 
 typedef struct DBTask {
     TaskType type;
-    char id1[64];     // node id or source
-    char id2[64];     // label (for add node) or target
-    char *metadata;   // JSON string (for node)
-    char *tags_str;   // comma-separated tags
+    char id1[64];
+    char id2[64];
+    char *metadata;
+    char *tags_str;
     struct DBTask *next;
 } DBTask;
 
@@ -127,7 +134,7 @@ pthread_cond_t task_cond = PTHREAD_COND_INITIALIZER;
 
 // ----------------------------- UI message queue (for Raylib) -----------------
 typedef struct UIMsg {
-    TaskType type;       // reusing same enum
+    TaskType type;
     char id1[64];
     char id2[64];
     char *metadata;
@@ -146,6 +153,91 @@ UIMsg* dequeue_ui_msg(void);
 void free_ui_msg(UIMsg *msg);
 void process_ui_messages(int max_count);
 
+// ----------------------------- Grid acceleration helpers --------------------
+typedef struct GridCell {
+    Node **nodes;        // dynamic array of node pointers
+    int count;
+    int capacity;
+} GridCell;
+
+GridCell *grid = NULL;
+int grid_width = 0, grid_height = 0;
+float grid_min_x = FLT_MAX, grid_min_y = FLT_MAX;
+float grid_max_x = -FLT_MAX, grid_max_y = -FLT_MAX;
+
+void update_grid_bounds(void) {
+    grid_min_x = FLT_MAX; grid_min_y = FLT_MAX;
+    grid_max_x = -FLT_MAX; grid_max_y = -FLT_MAX;
+    Node *n;
+    for (n = nodes; n != NULL; n = n->hh.next) {
+        if (n->x < grid_min_x) grid_min_x = n->x;
+        if (n->x > grid_max_x) grid_max_x = n->x;
+        if (n->y < grid_min_y) grid_min_y = n->y;
+        if (n->y > grid_max_y) grid_max_y = n->y;
+    }
+    // Add margin
+    grid_min_x -= CELL_SIZE;
+    grid_min_y -= CELL_SIZE;
+    grid_max_x += CELL_SIZE;
+    grid_max_y += CELL_SIZE;
+}
+
+int coord_to_cell_x(float x) {
+    return (int)((x - grid_min_x) / CELL_SIZE);
+}
+int coord_to_cell_y(float y) {
+    return (int)((y - grid_min_y) / CELL_SIZE);
+}
+
+void rebuild_grid(void) {
+    if (grid) {
+        for (int i = 0; i < grid_width * grid_height; i++) {
+            if (grid[i].nodes) free(grid[i].nodes);
+        }
+        free(grid);
+        grid = NULL;
+    }
+
+    update_grid_bounds();
+    float span_x = grid_max_x - grid_min_x;
+    float span_y = grid_max_y - grid_min_y;
+    grid_width = (int)(span_x / CELL_SIZE) + 2;
+    grid_height = (int)(span_y / CELL_SIZE) + 2;
+    if (grid_width <= 0) grid_width = 1;
+    if (grid_height <= 0) grid_height = 1;
+
+    grid = calloc(grid_width * grid_height, sizeof(GridCell));
+    if (!grid) return;
+
+    // Count nodes per cell (first pass)
+    Node *n;
+    for (n = nodes; n != NULL; n = n->hh.next) {
+        int cx = coord_to_cell_x(n->x);
+        int cy = coord_to_cell_y(n->y);
+        if (cx >= 0 && cx < grid_width && cy >= 0 && cy < grid_height) {
+            int idx = cy * grid_width + cx;
+            if (grid[idx].count >= grid[idx].capacity) {
+                grid[idx].capacity = grid[idx].capacity ? grid[idx].capacity * 2 : 8;
+                grid[idx].nodes = realloc(grid[idx].nodes, grid[idx].capacity * sizeof(Node*));
+            }
+            grid[idx].nodes[grid[idx].count++] = n;
+        }
+    }
+}
+
+void get_neighbor_cells(int cx, int cy, int *neighbors, int *count) {
+    *count = 0;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int nx = cx + dx;
+            int ny = cy + dy;
+            if (nx >= 0 && nx < grid_width && ny >= 0 && ny < grid_height) {
+                neighbors[(*count)++] = ny * grid_width + nx;
+            }
+        }
+    }
+}
+
 // ----------------------------- SQLite helpers (used by DB thread) -----------
 sqlite3* get_db_conn(void) {
     sqlite3 *conn;
@@ -155,11 +247,10 @@ sqlite3* get_db_conn(void) {
 }
 
 void db_insert_node_task(DBTask *task) {
-    sqlite3 *conn = get_db_conn();   // each task uses its own connection (simple)
+    sqlite3 *conn = get_db_conn();
     sqlite3_stmt *stmt;
     const char *sql = "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)";
     sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL);
-    // random position for new node
     float x = (float)((rand() % 1000) - 500);
     float y = (float)((rand() % 1000) - 500);
     sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
@@ -201,10 +292,6 @@ void db_insert_edge_task(DBTask *task) {
 }
 
 void db_insert_tags_task(DBTask *task) {
-    float x = task->x;    // add float x,y to DBTask
-    float y = task->y;
-    if (isnan(x)) { x = (float)((rand()%1000)-500); }
-    if (isnan(y)) { y = (float)((rand()%1000)-500); }
     if (!task->tags_str || strlen(task->tags_str) == 0) return;
     sqlite3 *conn = get_db_conn();
     char *copy = strdup(task->tags_str);
@@ -797,6 +884,122 @@ void mem_delete_edge(const char *src, const char *tgt) {
     rebuild_edge_list();
 }
 
+// ----------------------------- Force layout (with optional grid accel) ------
+void resolve_collisions(void) {
+    Node *n1, *n2;
+    for (n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
+        for (n2 = n1->hh.next; n2 != NULL; n2 = n2->hh.next) {
+            float dx = n1->x - n2->x;
+            float dy = n1->y - n2->y;
+            float dist = sqrtf(dx*dx + dy*dy);
+            if (dist < MIN_DISTANCE && dist > 0.001f) {
+                float overlap = MIN_DISTANCE - dist;
+                float angle = atan2f(dy, dx);
+                float push_x = cosf(angle) * overlap * 0.5f;
+                float push_y = sinf(angle) * overlap * 0.5f;
+                n1->x += push_x;
+                n1->y += push_y;
+                n2->x -= push_x;
+                n2->y -= push_y;
+            }
+        }
+    }
+}
+
+void update_layout(void) {
+    if (HASH_COUNT(nodes) == 0) return;
+
+    // Reset forces
+    for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
+        n1->fx = 0.0f;
+        n1->fy = 0.0f;
+    }
+
+    // ---- Repulsion ----
+    if (use_spatial_accel) {
+        // Grid‑based repulsion (O(N))
+        rebuild_grid();
+        int neighbors[9];
+        int neighbor_cnt;
+        for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
+            int cx = coord_to_cell_x(n1->x);
+            int cy = coord_to_cell_y(n1->y);
+            if (cx < 0 || cx >= grid_width || cy < 0 || cy >= grid_height) continue;
+            get_neighbor_cells(cx, cy, neighbors, &neighbor_cnt);
+            for (int k = 0; k < neighbor_cnt; k++) {
+                GridCell *cell = &grid[neighbors[k]];
+                for (int i = 0; i < cell->count; i++) {
+                    Node *n2 = cell->nodes[i];
+                    if (n1 == n2) continue;
+                    float dx = n1->x - n2->x;
+                    float dy = n1->y - n2->y;
+                    float dist_sq = dx*dx + dy*dy + 1e-5f;
+                    float dist = sqrtf(dist_sq);
+                    float force = REPULSION_STRENGTH / dist_sq;
+                    float fx = (dx / dist) * force;
+                    float fy = (dy / dist) * force;
+                    n1->fx += fx;
+                    n2->fx -= fx;
+                    n1->fy += fy;
+                    n2->fy -= fy;
+                }
+            }
+        }
+    } else {
+        // Original O(N²) repulsion
+        for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
+            for (Node *n2 = n1->hh.next; n2 != NULL; n2 = n2->hh.next) {
+                float dx = n1->x - n2->x;
+                float dy = n1->y - n2->y;
+                float dist_sq = dx*dx + dy*dy + 1e-5f;
+                float dist = sqrtf(dist_sq);
+                float force = REPULSION_STRENGTH / dist_sq;
+                float fx = (dx / dist) * force;
+                float fy = (dy / dist) * force;
+                n1->fx += fx;
+                n1->fy += fy;
+                n2->fx -= fx;
+                n2->fy -= fy;
+            }
+        }
+    }
+
+    // ---- Attraction (edges) - unchanged ----
+    for (int i = 0; i < edges_count; i++) {
+        Node *src = NULL, *tgt = NULL;
+        HASH_FIND_STR(nodes, edges_list[i].src, src);
+        HASH_FIND_STR(nodes, edges_list[i].tgt, tgt);
+        if (src && tgt) {
+            float dx = src->x - tgt->x;
+            float dy = src->y - tgt->y;
+            float dist = sqrtf(dx*dx + dy*dy) + 1e-5f;
+            float force = ATTRACTION_STRENGTH * (dist - DESIRED_EDGE_LENGTH);
+            float fx = (dx / dist) * force;
+            float fy = (dy / dist) * force;
+            src->fx -= fx;
+            src->fy -= fy;
+            tgt->fx += fx;
+            tgt->fy += fy;
+        }
+    }
+
+    // ---- Apply forces ----
+    for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
+        float fx = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fx));
+        float fy = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fy));
+        n1->x += fx * TIME_STEP;
+        n1->y += fy * TIME_STEP;
+        n1->fx *= DAMPING;
+        n1->fy *= DAMPING;
+        if (use_cage) {
+            n1->x = fmaxf(50.0f, fminf(WINDOW_WIDTH - 50.0f, n1->x));
+            n1->y = fmaxf(50.0f, fminf(WINDOW_HEIGHT - 50.0f, n1->y));
+        }
+    }
+
+    if (use_collisions) resolve_collisions();
+}
+
 // ----------------------------- Initial data load  ---------------------------
 void load_initial_data(void) {
     sqlite3_stmt *stmt;
@@ -833,7 +1036,6 @@ void add_sample_nodes(void) {
         mem_add_node("sample1", "Node Alpha", -150.0f, -80.0f, meta, tags1, 1);
         mem_add_node("sample2", "Node Beta", 180.0f, 90.0f, meta, tags1, 1);
         mem_add_edge("sample1", "sample2");
-        // Also persist them via DB thread? For simplicity, insert directly into DB now.
         sqlite3_stmt *stmt;
         sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
         sqlite3_bind_text(stmt, 1, "sample1", -1, SQLITE_STATIC);
@@ -869,82 +1071,6 @@ void add_sample_nodes(void) {
     }
 }
 
-// ----------------------------- Force layout (unchanged) --------------------
-void resolve_collisions(void) {
-    Node *n1, *n2;
-    for (n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-        for (n2 = n1->hh.next; n2 != NULL; n2 = n2->hh.next) {
-            float dx = n1->x - n2->x;
-            float dy = n1->y - n2->y;
-            float dist = sqrtf(dx*dx + dy*dy);
-            if (dist < MIN_DISTANCE && dist > 0.001f) {
-                float overlap = MIN_DISTANCE - dist;
-                float angle = atan2f(dy, dx);
-                float push_x = cosf(angle) * overlap * 0.5f;
-                float push_y = sinf(angle) * overlap * 0.5f;
-                n1->x += push_x;
-                n1->y += push_y;
-                n2->x -= push_x;
-                n2->y -= push_y;
-            }
-        }
-    }
-}
-
-void update_layout(void) {
-    if (HASH_COUNT(nodes) == 0) return;
-    Node *n1, *n2;
-    for (n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-        n1->fx = 0.0f;
-        n1->fy = 0.0f;
-    }
-    for (n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-        for (n2 = n1->hh.next; n2 != NULL; n2 = n2->hh.next) {
-            float dx = n1->x - n2->x;
-            float dy = n1->y - n2->y;
-            float dist_sq = dx*dx + dy*dy + 1e-5f;
-            float dist = sqrtf(dist_sq);
-            float force = REPULSION_STRENGTH / dist_sq;
-            float fx = (dx / dist) * force;
-            float fy = (dy / dist) * force;
-            n1->fx += fx;
-            n1->fy += fy;
-            n2->fx -= fx;
-            n2->fy -= fy;
-        }
-    }
-    for (int i = 0; i < edges_count; i++) {
-        Node *src = NULL, *tgt = NULL;
-        HASH_FIND_STR(nodes, edges_list[i].src, src);
-        HASH_FIND_STR(nodes, edges_list[i].tgt, tgt);
-        if (src && tgt) {
-            float dx = src->x - tgt->x;
-            float dy = src->y - tgt->y;
-            float dist = sqrtf(dx*dx + dy*dy) + 1e-5f;
-            float force = ATTRACTION_STRENGTH * (dist - DESIRED_EDGE_LENGTH);
-            float fx = (dx / dist) * force;
-            float fy = (dy / dist) * force;
-            src->fx -= fx;
-            src->fy -= fy;
-            tgt->fx += fx;
-            tgt->fy += fy;
-        }
-    }
-    for (n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-        float fx = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fx));
-        float fy = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fy));
-        n1->x += fx * TIME_STEP;
-        n1->y += fy * TIME_STEP;
-        n1->fx *= DAMPING;
-        n1->fy *= DAMPING;
-        if (use_cage) {
-            n1->x = fmaxf(50.0f, fminf(WINDOW_WIDTH - 50.0f, n1->x));
-            n1->y = fmaxf(50.0f, fminf(WINDOW_HEIGHT - 50.0f, n1->y));
-        }
-    }
-    if (use_collisions) resolve_collisions();
-}
-
 // ----------------------------- Command line parsing -------------------------
 void parse_args(int argc, char **argv) {
     static struct option long_options[] = {
@@ -952,15 +1078,17 @@ void parse_args(int argc, char **argv) {
         {"log-db",   no_argument, 0, 'D'},
         {"log-ui",   no_argument, 0, 'U'},
         {"ui-batch-size", required_argument, 0, 'b'},
+        {"spatial",  no_argument, 0, 's'},
         {0, 0, 0, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "HDUb:", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "HDUb:s", long_options, NULL)) != -1) {
         switch (c) {
             case 'H': log_http = true; break;
             case 'D': log_db = true; break;
             case 'U': log_ui = true; break;
             case 'b': ui_batch_size = atoi(optarg); if (ui_batch_size <= 0) ui_batch_size = DEFAULT_UI_BATCH_SIZE; break;
+            case 's': use_spatial_accel = true; break;
             default: break;
         }
     }
@@ -997,7 +1125,7 @@ int main(int argc, char **argv) {
     sqlite3_exec(db, sql, NULL, NULL, &errmsg);
     if (errmsg) { fprintf(stderr, "SQL error: %s\n", errmsg); sqlite3_free(errmsg); }
 
-    // Load initial data into memory (synchronous, before UI starts)
+    // Load initial data into memory
     load_initial_data();
     add_sample_nodes();
 
@@ -1024,11 +1152,12 @@ int main(int argc, char **argv) {
 
     // Main loop
     while (!WindowShouldClose()) {
-        // Process UI messages in batches to keep FPS stable
+        // Process UI messages in batches
         process_ui_messages(ui_batch_size);
 
-        // --- Input Handling (unchanged) ---
-        if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) {
+        // --- Input Handling ---
+        // Pan with RIGHT mouse button (changed from MIDDLE)
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
             Vector2 delta = GetMouseDelta();
             camera.target.x -= delta.x / camera.zoom;
             camera.target.y -= delta.y / camera.zoom;
@@ -1087,7 +1216,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < ITERATIONS_PER_FRAME && layout_enabled; i++)
             update_layout();
 
-        // --- Drawing (unchanged) ---
+        // --- Drawing ---
         BeginDrawing();
         ClearBackground(SOLARIZED_BASE03);
         BeginMode2D(camera);
@@ -1129,10 +1258,16 @@ int main(int argc, char **argv) {
 
         DrawText(TextFormat("FPS: %d", GetFPS()), 10, 10, 20, WHITE);
         int y_off = 40;
+        DrawText(TextFormat("Nodes: %d", HASH_COUNT(nodes)), 10, y_off, 16, WHITE);
+        y_off += 20;
         DrawText(layout_enabled ? "[L] Layout: ON" : "[L] Layout: OFF", 10, y_off, 16, layout_enabled ? LIME : RED); y_off += 20;
         DrawText(use_cage ? "[C] Cage: ON" : "[C] Cage: OFF (Infinity)", 10, y_off, 16, use_cage ? LIME : SKYBLUE); y_off += 20;
         DrawText(use_collisions ? "[X] Collisions: ON" : "[X] Collisions: OFF", 10, y_off, 16, use_collisions ? LIME : ORANGE);
-        DrawText("[S] Search | [R] Reset Camera | Middle-Mouse: Pan | Scroll: Zoom", 10, WINDOW_HEIGHT-30, 16, LIGHTGRAY);
+        if (use_spatial_accel) {
+            DrawText("[Spatial Accel: ON]", 10, y_off+20, 16, GREEN);
+            y_off += 20;
+        }
+        DrawText("[S] Search | [R] Reset | Right‑Mouse Pan | Scroll Zoom", 10, WINDOW_HEIGHT-30, 16, LIGHTGRAY);
 
         if (search_active) {
             Rectangle bar = { 10, 140, 300, 30 };
@@ -1170,7 +1305,6 @@ int main(int argc, char **argv) {
         EndDrawing();
     }
 
-    // Cleanup (the daemons and threads will be terminated, but for simplicity we exit)
     MHD_stop_daemon(http_daemon);
     sqlite3_close(db);
     CloseWindow();

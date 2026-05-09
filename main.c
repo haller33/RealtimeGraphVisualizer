@@ -1,7 +1,8 @@
 // main.c – Graph Visualizer with Raylib + HTTP API + SQLite (C version)
-// Multi‑threaded version with optional spatial acceleration (grid) and right‑click pan.
+// Multi‑threaded with background layout using message passing (no shared graph).
+// UI thread owns one graph, layout thread owns another, synchronized via messages.
 // Compile: gcc -o graph_visualizer main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm
-// Usage: ./graph_visualizer [--spatial] [--log-http] [--log-db] [--log-ui] [--ui-batch-size N]
+// Usage: ./graph_visualizer [--spatial] [--background-layout] [--log-http] [--log-db] [--log-ui] [--ui-batch-size N]
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +36,7 @@
 #define TIME_STEP               0.1f
 
 // Grid acceleration
-#define CELL_SIZE               (DESIRED_EDGE_LENGTH * 2.0f)  // 300.0f
+#define CELL_SIZE               (DESIRED_EDGE_LENGTH * 2.0f)
 
 #define NODE_RADIUS             12
 #define SELECTED_NODE_RADIUS    16
@@ -51,7 +52,8 @@
 bool layout_enabled = true;
 bool use_cage = false;
 bool use_collisions = true;
-bool use_spatial_accel = false;   // NEW: spatial acceleration flag
+bool use_spatial_accel = false;
+bool use_background_layout = false;
 
 // ----------------------------- Logging flags ---------------------------------
 bool log_http = false;
@@ -59,12 +61,12 @@ bool log_db = false;
 bool log_ui = false;
 int ui_batch_size = DEFAULT_UI_BATCH_SIZE;
 
-// ----------------------------- Uthash structures (in-memory graph) ----------
+// ----------------------------- Graph structures (shared type definitions) ---
 typedef struct Node {
     char id[64];
     char label[128];
     float x, y;
-    float fx, fy;
+    float fx, fy;        // force vectors (only used by layout thread)
     char *metadata;
     UT_hash_handle hh;
 } Node;
@@ -86,27 +88,35 @@ typedef struct NodeTags {
     UT_hash_handle hh;
 } NodeTags;
 
-// Forward declarations for in‑memory graph helpers
-void mem_add_node(const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count);
-void mem_add_edge(const char *src, const char *tgt);
-void mem_add_tags(const char *node_id, const char **tags, int tag_count);
-void mem_delete_node(const char *node_id);
-void mem_delete_edge(const char *src, const char *tgt);
-void rebuild_edge_list(void);
-
-Node *nodes = NULL;
-EdgeSet *edges_set = NULL;
-NodeTags *tags_hash = NULL;
-
 typedef struct Edge {
     char src[64];
     char tgt[64];
 } Edge;
-Edge *edges_list = NULL;
-int edges_count = 0;
-int edges_capacity = 0;
 
-// ----------------------------- Database & persistent storage -----------------
+// Forward declarations for graph helpers (now accept pointer to the graph’s root)
+void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count);
+void mem_add_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt);
+void mem_add_tags(NodeTags **tags_hash, const char *node_id, const char **tags, int tag_count);
+void mem_delete_node(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *node_id);
+void mem_delete_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt);
+void rebuild_edge_list(EdgeSet *edges_set, Edge **edges_list, int *edges_count, int *edges_capacity);
+void compute_layout_iteration(Node *nodes, Edge *edges_list, int edges_count, bool use_spatial, bool use_cage_flag, bool use_collisions_flag);
+
+// ----------------------------- UI thread’s graph ----------------------------
+Node *nodes_ui = NULL;
+EdgeSet *edges_set_ui = NULL;
+NodeTags *tags_hash_ui = NULL;
+Edge *edges_list_ui = NULL;
+int edges_count_ui = 0, edges_capacity_ui = 0;
+
+// ----------------------------- Layout thread’s graph ------------------------
+Node *nodes_layout = NULL;
+EdgeSet *edges_set_layout = NULL;
+NodeTags *tags_hash_layout = NULL;
+Edge *edges_list_layout = NULL;
+int edges_count_layout = 0, edges_capacity_layout = 0;
+
+// ----------------------------- Database -------------------------------------
 static const char *DB_URI = "file::memory:?cache=shared";
 sqlite3 *db = NULL;
 
@@ -116,7 +126,8 @@ typedef enum {
     TASK_ADD_EDGE,
     TASK_ADD_TAGS,
     TASK_DELETE_NODE,
-    TASK_DELETE_EDGE
+    TASK_DELETE_EDGE,
+    TASK_POSITION_UPDATE    // batched positions from layout thread
 } TaskType;
 
 typedef struct DBTask {
@@ -132,18 +143,34 @@ DBTask *task_head = NULL, *task_tail = NULL;
 pthread_mutex_t task_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t task_cond = PTHREAD_COND_INITIALIZER;
 
-// ----------------------------- UI message queue (for Raylib) -----------------
+// ----------------------------- UI message queue -----------------------------
 typedef struct UIMsg {
     TaskType type;
     char id1[64];
     char id2[64];
     char *metadata;
     char *tags_str;
+    int pos_count;                 // for TASK_POSITION_UPDATE
+    struct { char id[64]; float x, y; } *pos_updates; // flexible array
     struct UIMsg *next;
 } UIMsg;
 
 UIMsg *ui_head = NULL, *ui_tail = NULL;
 pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// ----------------------------- Layout update queue (structure changes) ------
+typedef struct LayoutUpdate {
+    TaskType type;
+    char id1[64];
+    char id2[64];
+    char *metadata;
+    char *tags_str;
+    struct LayoutUpdate *next;
+} LayoutUpdate;
+
+LayoutUpdate *layout_update_head = NULL, *layout_update_tail = NULL;
+pthread_mutex_t layout_update_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t layout_update_cond = PTHREAD_COND_INITIALIZER;
 
 // Forward declarations for queue functions
 void enqueue_task(DBTask *task);
@@ -152,70 +179,53 @@ void enqueue_ui_msg(UIMsg *msg);
 UIMsg* dequeue_ui_msg(void);
 void free_ui_msg(UIMsg *msg);
 void process_ui_messages(int max_count);
+void enqueue_layout_update(LayoutUpdate *upd);
+LayoutUpdate* dequeue_layout_update(void);
+void free_layout_update(LayoutUpdate *upd);
+void apply_layout_update_to_back(LayoutUpdate *upd);
 
-// ----------------------------- Grid acceleration helpers --------------------
+// ----------------------------- Background layout thread ---------------------
+void* layout_thread_func(void *arg);
+
+// ----------------------------- Grid helpers (unchanged) ---------------------
 typedef struct GridCell {
-    Node **nodes;        // dynamic array of node pointers
+    Node **nodes;
     int count;
     int capacity;
 } GridCell;
 
-GridCell *grid = NULL;
-int grid_width = 0, grid_height = 0;
-float grid_min_x = FLT_MAX, grid_min_y = FLT_MAX;
-float grid_max_x = -FLT_MAX, grid_max_y = -FLT_MAX;
-
-void update_grid_bounds(void) {
-    grid_min_x = FLT_MAX; grid_min_y = FLT_MAX;
-    grid_max_x = -FLT_MAX; grid_max_y = -FLT_MAX;
-    Node *n;
-    for (n = nodes; n != NULL; n = n->hh.next) {
-        if (n->x < grid_min_x) grid_min_x = n->x;
-        if (n->x > grid_max_x) grid_max_x = n->x;
-        if (n->y < grid_min_y) grid_min_y = n->y;
-        if (n->y > grid_max_y) grid_max_y = n->y;
+void update_grid_bounds_for_table(Node *nodes, float *min_x, float *min_y, float *max_x, float *max_y) {
+    *min_x = FLT_MAX; *min_y = FLT_MAX;
+    *max_x = -FLT_MAX; *max_y = -FLT_MAX;
+    for (Node *n = nodes; n; n = n->hh.next) {
+        if (n->x < *min_x) *min_x = n->x;
+        if (n->x > *max_x) *max_x = n->x;
+        if (n->y < *min_y) *min_y = n->y;
+        if (n->y > *max_y) *max_y = n->y;
     }
-    // Add margin
-    grid_min_x -= CELL_SIZE;
-    grid_min_y -= CELL_SIZE;
-    grid_max_x += CELL_SIZE;
-    grid_max_y += CELL_SIZE;
+    *min_x -= CELL_SIZE; *min_y -= CELL_SIZE;
+    *max_x += CELL_SIZE; *max_y += CELL_SIZE;
 }
 
-int coord_to_cell_x(float x) {
-    return (int)((x - grid_min_x) / CELL_SIZE);
-}
-int coord_to_cell_y(float y) {
-    return (int)((y - grid_min_y) / CELL_SIZE);
-}
+int coord_to_cell_x(float x, float min_x) { return (int)((x - min_x) / CELL_SIZE); }
+int coord_to_cell_y(float y, float min_y) { return (int)((y - min_y) / CELL_SIZE); }
 
-void rebuild_grid(void) {
-    if (grid) {
-        for (int i = 0; i < grid_width * grid_height; i++) {
-            if (grid[i].nodes) free(grid[i].nodes);
-        }
-        free(grid);
-        grid = NULL;
-    }
+GridCell* rebuild_grid_for_table(Node *nodes, int *width, int *height, float *min_x, float *min_y, float *max_x, float *max_y) {
+    update_grid_bounds_for_table(nodes, min_x, min_y, max_x, max_y);
+    float span_x = *max_x - *min_x, span_y = *max_y - *min_y;
+    *width = (int)(span_x / CELL_SIZE) + 2;
+    *height = (int)(span_y / CELL_SIZE) + 2;
+    if (*width <= 0) *width = 1;
+    if (*height <= 0) *height = 1;
 
-    update_grid_bounds();
-    float span_x = grid_max_x - grid_min_x;
-    float span_y = grid_max_y - grid_min_y;
-    grid_width = (int)(span_x / CELL_SIZE) + 2;
-    grid_height = (int)(span_y / CELL_SIZE) + 2;
-    if (grid_width <= 0) grid_width = 1;
-    if (grid_height <= 0) grid_height = 1;
+    GridCell *grid = calloc((*width) * (*height), sizeof(GridCell));
+    if (!grid) return NULL;
 
-    grid = calloc(grid_width * grid_height, sizeof(GridCell));
-    if (!grid) return;
-
-    // Count nodes per cell (first pass)
-    Node *n;
-    for (n = nodes; n != NULL; n = n->hh.next) {
-        int cx = coord_to_cell_x(n->x);
-        int cy = coord_to_cell_y(n->y);
-        if (cx >= 0 && cx < grid_width && cy >= 0 && cy < grid_height) {
-            int idx = cy * grid_width + cx;
+    for (Node *n = nodes; n; n = n->hh.next) {
+        int cx = coord_to_cell_x(n->x, *min_x);
+        int cy = coord_to_cell_y(n->y, *min_y);
+        if (cx >= 0 && cx < *width && cy >= 0 && cy < *height) {
+            int idx = cy * (*width) + cx;
             if (grid[idx].count >= grid[idx].capacity) {
                 grid[idx].capacity = grid[idx].capacity ? grid[idx].capacity * 2 : 8;
                 grid[idx].nodes = realloc(grid[idx].nodes, grid[idx].capacity * sizeof(Node*));
@@ -223,22 +233,119 @@ void rebuild_grid(void) {
             grid[idx].nodes[grid[idx].count++] = n;
         }
     }
+    return grid;
 }
 
-void get_neighbor_cells(int cx, int cy, int *neighbors, int *count) {
+void free_grid(GridCell *grid, int width, int height) {
+    if (!grid) return;
+    for (int i = 0; i < width * height; i++)
+        if (grid[i].nodes) free(grid[i].nodes);
+    free(grid);
+}
+
+void get_neighbor_cells(int cx, int cy, int width, int height, int *neighbors, int *count) {
     *count = 0;
-    for (int dy = -1; dy <= 1; dy++) {
+    for (int dy = -1; dy <= 1; dy++)
         for (int dx = -1; dx <= 1; dx++) {
-            int nx = cx + dx;
-            int ny = cy + dy;
-            if (nx >= 0 && nx < grid_width && ny >= 0 && ny < grid_height) {
-                neighbors[(*count)++] = ny * grid_width + nx;
-            }
+            int nx = cx + dx, ny = cy + dy;
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height)
+                neighbors[(*count)++] = ny * width + nx;
         }
+}
+
+// ----------------------------- Layout function (works on any graph) ---------
+void compute_layout_iteration(Node *nodes, Edge *edges_list, int edges_count, bool use_spatial, bool use_cage_flag, bool use_collisions_flag) {
+    if (!nodes) return;
+    for (Node *n1 = nodes; n1; n1 = n1->hh.next) n1->fx = n1->fy = 0.0f;
+
+    // Repulsion
+    if (use_spatial) {
+        float min_x, min_y, max_x, max_y;
+        int gw, gh;
+        GridCell *grid = rebuild_grid_for_table(nodes, &gw, &gh, &min_x, &min_y, &max_x, &max_y);
+        if (grid) {
+            int neighbors[9], neighbor_cnt;
+            for (Node *n1 = nodes; n1; n1 = n1->hh.next) {
+                int cx = coord_to_cell_x(n1->x, min_x);
+                int cy = coord_to_cell_y(n1->y, min_y);
+                if (cx < 0 || cx >= gw || cy < 0 || cy >= gh) continue;
+                get_neighbor_cells(cx, cy, gw, gh, neighbors, &neighbor_cnt);
+                for (int k = 0; k < neighbor_cnt; k++) {
+                    GridCell *cell = &grid[neighbors[k]];
+                    for (int i = 0; i < cell->count; i++) {
+                        Node *n2 = cell->nodes[i];
+                        if (n1 == n2) continue;
+                        float dx = n1->x - n2->x, dy = n1->y - n2->y;
+                        float dist_sq = dx*dx + dy*dy + 1e-5f;
+                        float dist = sqrtf(dist_sq);
+                        float force = REPULSION_STRENGTH / dist_sq;
+                        float fx = (dx / dist) * force, fy = (dy / dist) * force;
+                        n1->fx += fx; n2->fx -= fx;
+                        n1->fy += fy; n2->fy -= fy;
+                    }
+                }
+            }
+            free_grid(grid, gw, gh);
+        }
+    } else {
+        for (Node *n1 = nodes; n1; n1 = n1->hh.next)
+            for (Node *n2 = n1->hh.next; n2; n2 = n2->hh.next) {
+                float dx = n1->x - n2->x, dy = n1->y - n2->y;
+                float dist_sq = dx*dx + dy*dy + 1e-5f, dist = sqrtf(dist_sq);
+                float force = REPULSION_STRENGTH / dist_sq;
+                float fx = (dx / dist) * force, fy = (dy / dist) * force;
+                n1->fx += fx; n1->fy += fy;
+                n2->fx -= fx; n2->fy -= fy;
+            }
+    }
+
+    // Attraction (edges)
+    for (int i = 0; i < edges_count; i++) {
+        Node *src = NULL, *tgt = NULL;
+        HASH_FIND_STR(nodes, edges_list[i].src, src);
+        HASH_FIND_STR(nodes, edges_list[i].tgt, tgt);
+        if (src && tgt) {
+            float dx = src->x - tgt->x, dy = src->y - tgt->y;
+            float dist = sqrtf(dx*dx + dy*dy) + 1e-5f;
+            float force = ATTRACTION_STRENGTH * (dist - DESIRED_EDGE_LENGTH);
+            float fx = (dx / dist) * force, fy = (dy / dist) * force;
+            src->fx -= fx; src->fy -= fy;
+            tgt->fx += fx; tgt->fy += fy;
+        }
+    }
+
+    // Apply forces
+    for (Node *n1 = nodes; n1; n1 = n1->hh.next) {
+        float fx = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fx));
+        float fy = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fy));
+        n1->x += fx * TIME_STEP;
+        n1->y += fy * TIME_STEP;
+        n1->fx *= DAMPING; n1->fy *= DAMPING;
+        if (use_cage_flag) {
+            n1->x = fmaxf(50.0f, fminf(WINDOW_WIDTH - 50.0f, n1->x));
+            n1->y = fmaxf(50.0f, fminf(WINDOW_HEIGHT - 50.0f, n1->y));
+        }
+    }
+
+    // Collisions
+    if (use_collisions_flag) {
+        for (Node *n1 = nodes; n1; n1 = n1->hh.next)
+            for (Node *n2 = n1->hh.next; n2; n2 = n2->hh.next) {
+                float dx = n1->x - n2->x, dy = n1->y - n2->y;
+                float dist = sqrtf(dx*dx + dy*dy);
+                if (dist < MIN_DISTANCE && dist > 0.001f) {
+                    float overlap = MIN_DISTANCE - dist;
+                    float angle = atan2f(dy, dx);
+                    float push_x = cosf(angle) * overlap * 0.5f;
+                    float push_y = sinf(angle) * overlap * 0.5f;
+                    n1->x += push_x; n1->y += push_y;
+                    n2->x -= push_x; n2->y -= push_y;
+                }
+            }
     }
 }
 
-// ----------------------------- SQLite helpers (used by DB thread) -----------
+// ----------------------------- SQLite helpers (unchanged) -------------------
 sqlite3* get_db_conn(void) {
     sqlite3 *conn;
     sqlite3_open(DB_URI, &conn);
@@ -249,8 +356,7 @@ sqlite3* get_db_conn(void) {
 void db_insert_node_task(DBTask *task) {
     sqlite3 *conn = get_db_conn();
     sqlite3_stmt *stmt;
-    const char *sql = "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)";
-    sqlite3_prepare_v2(conn, sql, -1, &stmt, NULL);
+    sqlite3_prepare_v2(conn, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
     float x = (float)((rand() % 1000) - 500);
     float y = (float)((rand() % 1000) - 500);
     sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
@@ -261,7 +367,6 @@ void db_insert_node_task(DBTask *task) {
     if (sqlite3_step(stmt) != SQLITE_DONE && log_db)
         fprintf(stderr, "DB: insert node failed: %s\n", sqlite3_errmsg(conn));
     sqlite3_finalize(stmt);
-    // tags
     if (task->tags_str && strlen(task->tags_str) > 0) {
         char *copy = strdup(task->tags_str);
         char *token = strtok(copy, ",");
@@ -337,21 +442,16 @@ void db_delete_edge_task(DBTask *task) {
 void enqueue_task(DBTask *task) {
     pthread_mutex_lock(&task_mutex);
     task->next = NULL;
-    if (task_tail) {
-        task_tail->next = task;
-        task_tail = task;
-    } else {
-        task_head = task_tail = task;
-    }
+    if (task_tail) task_tail->next = task;
+    else task_head = task;
+    task_tail = task;
     pthread_cond_signal(&task_cond);
     pthread_mutex_unlock(&task_mutex);
 }
 
 DBTask* dequeue_task(void) {
     pthread_mutex_lock(&task_mutex);
-    while (task_head == NULL) {
-        pthread_cond_wait(&task_cond, &task_mutex);
-    }
+    while (!task_head) pthread_cond_wait(&task_cond, &task_mutex);
     DBTask *task = task_head;
     task_head = task->next;
     if (!task_head) task_tail = NULL;
@@ -362,12 +462,9 @@ DBTask* dequeue_task(void) {
 void enqueue_ui_msg(UIMsg *msg) {
     pthread_mutex_lock(&ui_mutex);
     msg->next = NULL;
-    if (ui_tail) {
-        ui_tail->next = msg;
-        ui_tail = msg;
-    } else {
-        ui_head = ui_tail = msg;
-    }
+    if (ui_tail) ui_tail->next = msg;
+    else ui_head = msg;
+    ui_tail = msg;
     pthread_mutex_unlock(&ui_mutex);
 }
 
@@ -385,9 +482,89 @@ UIMsg* dequeue_ui_msg(void) {
 void free_ui_msg(UIMsg *msg) {
     if (msg->metadata) free(msg->metadata);
     if (msg->tags_str) free(msg->tags_str);
+    if (msg->pos_updates) free(msg->pos_updates);
     free(msg);
 }
 
+void enqueue_layout_update(LayoutUpdate *upd) {
+    pthread_mutex_lock(&layout_update_mutex);
+    upd->next = NULL;
+    if (layout_update_tail) layout_update_tail->next = upd;
+    else layout_update_head = upd;
+    layout_update_tail = upd;
+    pthread_cond_signal(&layout_update_cond);
+    pthread_mutex_unlock(&layout_update_mutex);
+}
+
+LayoutUpdate* dequeue_layout_update(void) {
+    pthread_mutex_lock(&layout_update_mutex);
+    LayoutUpdate *upd = layout_update_head;
+    if (upd) {
+        layout_update_head = upd->next;
+        if (!layout_update_head) layout_update_tail = NULL;
+    }
+    pthread_mutex_unlock(&layout_update_mutex);
+    return upd;
+}
+
+void free_layout_update(LayoutUpdate *upd) {
+    if (upd->metadata) free(upd->metadata);
+    if (upd->tags_str) free(upd->tags_str);
+    free(upd);
+}
+
+void apply_layout_update_to_back(LayoutUpdate *upd) {
+    switch (upd->type) {
+        case TASK_ADD_NODE: {
+            int tag_cnt = 0;
+            const char **tags = NULL;
+            if (upd->tags_str && strlen(upd->tags_str)) {
+                char *copy = strdup(upd->tags_str);
+                char *token = strtok(copy, ",");
+                while (token) {
+                    tags = realloc(tags, (tag_cnt+1)*sizeof(const char*));
+                    tags[tag_cnt++] = strdup(token);
+                    token = strtok(NULL, ",");
+                }
+                free(copy);
+            }
+            float x = (float)((rand() % 1000) - 500);
+            float y = (float)((rand() % 1000) - 500);
+            mem_add_node(&nodes_layout, &tags_hash_layout, upd->id1, upd->id2, x, y, upd->metadata, tags, tag_cnt);
+            for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
+            free(tags);
+            break;
+        }
+        case TASK_ADD_EDGE:
+            mem_add_edge(&edges_set_layout, &edges_list_layout, &edges_count_layout, &edges_capacity_layout, upd->id1, upd->id2);
+            break;
+        case TASK_ADD_TAGS: {
+            char *copy = strdup(upd->tags_str);
+            char *token = strtok(copy, ",");
+            const char **tags = NULL;
+            int cnt = 0;
+            while (token) {
+                tags = realloc(tags, (cnt+1)*sizeof(const char*));
+                tags[cnt++] = strdup(token);
+                token = strtok(NULL, ",");
+            }
+            mem_add_tags(&tags_hash_layout, upd->id1, tags, cnt);
+            for (int i=0; i<cnt; i++) free((void*)tags[i]);
+            free(tags);
+            free(copy);
+            break;
+        }
+        case TASK_DELETE_NODE:
+            mem_delete_node(&nodes_layout, &tags_hash_layout, &edges_set_layout, &edges_list_layout, &edges_count_layout, &edges_capacity_layout, upd->id1);
+            break;
+        case TASK_DELETE_EDGE:
+            mem_delete_edge(&edges_set_layout, &edges_list_layout, &edges_count_layout, &edges_capacity_layout, upd->id1, upd->id2);
+            break;
+        default: break;
+    }
+}
+
+// Process UI messages (called from main thread)
 void process_ui_messages(int max_count) {
     int processed = 0;
     UIMsg *msg;
@@ -396,7 +573,7 @@ void process_ui_messages(int max_count) {
             case TASK_ADD_NODE: {
                 int tag_cnt = 0;
                 const char **tags = NULL;
-                if (msg->tags_str && strlen(msg->tags_str) > 0) {
+                if (msg->tags_str && strlen(msg->tags_str)) {
                     char *copy = strdup(msg->tags_str);
                     char *token = strtok(copy, ",");
                     while (token) {
@@ -408,16 +585,28 @@ void process_ui_messages(int max_count) {
                 }
                 float x = (float)((rand() % 1000) - 500);
                 float y = (float)((rand() % 1000) - 500);
-                mem_add_node(msg->id1, msg->id2, x, y, msg->metadata, tags, tag_cnt);
+                mem_add_node(&nodes_ui, &tags_hash_ui, msg->id1, msg->id2, x, y, msg->metadata, tags, tag_cnt);
+                // Also send to layout thread
+                LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
+                upd->type = TASK_ADD_NODE;
+                strcpy(upd->id1, msg->id1); strcpy(upd->id2, msg->id2);
+                if (msg->metadata) upd->metadata = strdup(msg->metadata);
+                if (msg->tags_str) upd->tags_str = strdup(msg->tags_str);
+                enqueue_layout_update(upd);
                 for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
                 free(tags);
                 if (log_ui) printf("UI: added node %s\n", msg->id1);
                 break;
             }
-            case TASK_ADD_EDGE:
-                mem_add_edge(msg->id1, msg->id2);
+            case TASK_ADD_EDGE: {
+                mem_add_edge(&edges_set_ui, &edges_list_ui, &edges_count_ui, &edges_capacity_ui, msg->id1, msg->id2);
+                LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
+                upd->type = TASK_ADD_EDGE;
+                strcpy(upd->id1, msg->id1); strcpy(upd->id2, msg->id2);
+                enqueue_layout_update(upd);
                 if (log_ui) printf("UI: added edge %s->%s\n", msg->id1, msg->id2);
                 break;
+            }
             case TASK_ADD_TAGS: {
                 char *copy = strdup(msg->tags_str);
                 char *token = strtok(copy, ",");
@@ -428,20 +617,51 @@ void process_ui_messages(int max_count) {
                     tags[cnt++] = strdup(token);
                     token = strtok(NULL, ",");
                 }
-                mem_add_tags(msg->id1, tags, cnt);
+                mem_add_tags(&tags_hash_ui, msg->id1, tags, cnt);
+                LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
+                upd->type = TASK_ADD_TAGS;
+                strcpy(upd->id1, msg->id1);
+                if (msg->tags_str) upd->tags_str = strdup(msg->tags_str);
+                enqueue_layout_update(upd);
                 for (int i=0; i<cnt; i++) free((void*)tags[i]);
                 free(tags);
                 free(copy);
                 if (log_ui) printf("UI: added tags to %s\n", msg->id1);
                 break;
             }
-            case TASK_DELETE_NODE:
-                mem_delete_node(msg->id1);
+            case TASK_DELETE_NODE: {
+                mem_delete_node(&nodes_ui, &tags_hash_ui, &edges_set_ui, &edges_list_ui, &edges_count_ui, &edges_capacity_ui, msg->id1);
+                LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
+                upd->type = TASK_DELETE_NODE;
+                strcpy(upd->id1, msg->id1);
+                enqueue_layout_update(upd);
                 if (log_ui) printf("UI: deleted node %s\n", msg->id1);
                 break;
-            case TASK_DELETE_EDGE:
-                mem_delete_edge(msg->id1, msg->id2);
+            }
+            case TASK_DELETE_EDGE: {
+                mem_delete_edge(&edges_set_ui, &edges_list_ui, &edges_count_ui, &edges_capacity_ui, msg->id1, msg->id2);
+                LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
+                upd->type = TASK_DELETE_EDGE;
+                strcpy(upd->id1, msg->id1); strcpy(upd->id2, msg->id2);
+                enqueue_layout_update(upd);
                 if (log_ui) printf("UI: deleted edge %s->%s\n", msg->id1, msg->id2);
+                break;
+            }
+            case TASK_POSITION_UPDATE: {
+                // Apply batched position updates to UI graph
+                for (int i = 0; i < msg->pos_count; i++) {
+                    Node *node = NULL;
+                    HASH_FIND_STR(nodes_ui, msg->pos_updates[i].id, node);
+                    if (node) {
+                        node->x = msg->pos_updates[i].x;
+                        node->y = msg->pos_updates[i].y;
+                    }
+                }
+                if (log_ui) printf("UI: applied %d position updates\n", msg->pos_count);
+                break;
+            }
+            default:
+                if (log_ui) printf("UI: unknown message type %d\n", msg->type);
                 break;
         }
         free_ui_msg(msg);
@@ -457,31 +677,21 @@ void* db_thread_func(void *arg) {
         DBTask *task = dequeue_task();
         if (!task) continue;
         switch (task->type) {
-            case TASK_ADD_NODE:
-                db_insert_node_task(task);
-                break;
-            case TASK_ADD_EDGE:
-                db_insert_edge_task(task);
-                break;
-            case TASK_ADD_TAGS:
-                db_insert_tags_task(task);
-                break;
-            case TASK_DELETE_NODE:
-                db_delete_node_task(task);
-                break;
-            case TASK_DELETE_EDGE:
-                db_delete_edge_task(task);
-                break;
+            case TASK_ADD_NODE: db_insert_node_task(task); break;
+            case TASK_ADD_EDGE: db_insert_edge_task(task); break;
+            case TASK_ADD_TAGS: db_insert_tags_task(task); break;
+            case TASK_DELETE_NODE: db_delete_node_task(task); break;
+            case TASK_DELETE_EDGE: db_delete_edge_task(task); break;
+            default: if (log_db) printf("DB thread ignoring task type %d\n", task->type); break;
         }
-        // After successful DB operation, forward to UI thread
-        UIMsg *uimsg = calloc(1, sizeof(UIMsg));
-        uimsg->type = task->type;
-        strncpy(uimsg->id1, task->id1, sizeof(uimsg->id1)-1);
-        strncpy(uimsg->id2, task->id2, sizeof(uimsg->id2)-1);
-        if (task->metadata) uimsg->metadata = strdup(task->metadata);
-        if (task->tags_str) uimsg->tags_str = strdup(task->tags_str);
-        enqueue_ui_msg(uimsg);
-        // Clean up task
+        if (task->type != TASK_POSITION_UPDATE) {
+            UIMsg *uimsg = calloc(1, sizeof(UIMsg));
+            uimsg->type = task->type;
+            strcpy(uimsg->id1, task->id1); strcpy(uimsg->id2, task->id2);
+            if (task->metadata) uimsg->metadata = strdup(task->metadata);
+            if (task->tags_str) uimsg->tags_str = strdup(task->tags_str);
+            enqueue_ui_msg(uimsg);
+        }
         if (task->metadata) free(task->metadata);
         if (task->tags_str) free(task->tags_str);
         free(task);
@@ -489,7 +699,59 @@ void* db_thread_func(void *arg) {
     return NULL;
 }
 
-// ----------------------------- HTTP Server (thread) -------------------------
+// ----------------------------- Background layout thread ---------------------
+void* layout_thread_func(void *arg) {
+    (void)arg;
+    if (log_ui) printf("Layout thread started\n");
+
+    // Clone the UI graph into layout graph at start
+    for (Node *n = nodes_ui; n; n = n->hh.next) {
+        mem_add_node(&nodes_layout, &tags_hash_layout, n->id, n->label, n->x, n->y, n->metadata, NULL, 0);
+    }
+    for (int i = 0; i < edges_count_ui; i++) {
+        mem_add_edge(&edges_set_layout, &edges_list_layout, &edges_count_layout, &edges_capacity_layout,
+                     edges_list_ui[i].src, edges_list_ui[i].tgt);
+    }
+
+    while (1) {
+        // Apply any pending structural updates
+        LayoutUpdate *upd;
+        while ((upd = dequeue_layout_update()) != NULL) {
+            apply_layout_update_to_back(upd);
+            free_layout_update(upd);
+        }
+
+        // Run one layout iteration on the layout copy
+        if (layout_enabled && nodes_layout) {
+            compute_layout_iteration(nodes_layout, edges_list_layout, edges_count_layout,
+                                     use_spatial_accel, use_cage, use_collisions);
+        }
+
+        // Build a batch of position updates (all nodes)
+        int node_count = HASH_COUNT(nodes_layout);
+        if (node_count > 0) {
+            UIMsg *pos_msg = calloc(1, sizeof(UIMsg));
+            pos_msg->type = TASK_POSITION_UPDATE;
+            pos_msg->pos_count = node_count;
+            pos_msg->pos_updates = malloc(node_count * sizeof(*pos_msg->pos_updates));
+            int idx = 0;
+            for (Node *n = nodes_layout; n; n = n->hh.next) {
+                strcpy(pos_msg->pos_updates[idx].id, n->id);
+                pos_msg->pos_updates[idx].x = n->x;
+                pos_msg->pos_updates[idx].y = n->y;
+                idx++;
+            }
+            enqueue_ui_msg(pos_msg);
+        }
+
+        // Throttle to avoid flooding UI (roughly 60 updates per second)
+        struct timespec ts = {0, 10000000}; // 10 ms
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
+// ----------------------------- HTTP Server (unchanged) ----------------------
 static struct MHD_Daemon *http_daemon = NULL;
 
 typedef struct {
@@ -564,7 +826,6 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
                 }
             }
 
-            // Build comma-separated tags string
             char *tags_buf = NULL;
             if (actual_tag_cnt > 0) {
                 size_t buf_len = 1;
@@ -670,7 +931,6 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
             return send_json_response(connection, 202, "{\"status\":\"accepted\"}");
         }
     }
-    // GET requests (unchanged) – they read directly from SQLite, no queue
     else if (strcmp(method, "GET") == 0) {
         if (strcmp(url, "/nodes") == 0) {
             const char *tag = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "tag");
@@ -754,29 +1014,26 @@ void* http_thread_func(void *arg) {
     return NULL;
 }
 
-// ----------------------------- In‑memory helpers (definitions) --------------
-void mem_add_node(const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count) {
+// ----------------------------- Graph helpers (definitions) ------------------
+void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count) {
     Node *node = malloc(sizeof(Node));
-    strncpy(node->id, id, sizeof(node->id)-1);
-    node->id[sizeof(node->id)-1] = '\0';
-    strncpy(node->label, label, sizeof(node->label)-1);
-    node->label[sizeof(node->label)-1] = '\0';
+    strncpy(node->id, id, sizeof(node->id)-1); node->id[sizeof(node->id)-1] = '\0';
+    strncpy(node->label, label, sizeof(node->label)-1); node->label[sizeof(node->label)-1] = '\0';
     node->x = x; node->y = y;
     node->fx = node->fy = 0.0f;
     node->metadata = malloc(strlen(metadata)+1);
     strcpy(node->metadata, metadata);
-    HASH_ADD_STR(nodes, id, node);
+    HASH_ADD_STR(*nodes, id, node);
 
     NodeTags *nt = NULL;
-    HASH_FIND_STR(tags_hash, id, nt);
+    HASH_FIND_STR(*tags_hash, id, nt);
     if (!nt) {
         nt = malloc(sizeof(NodeTags));
         strncpy(nt->node_id, id, sizeof(nt->node_id)-1);
         nt->node_id[sizeof(nt->node_id)-1] = '\0';
-        nt->tags.count = 0;
-        nt->tags.capacity = 4;
+        nt->tags.count = 0; nt->tags.capacity = 4;
         nt->tags.tags = malloc(nt->tags.capacity * sizeof(char*));
-        HASH_ADD_STR(tags_hash, node_id, nt);
+        HASH_ADD_STR(*tags_hash, node_id, nt);
     }
     for (int i = 0; i < tag_count; i++) {
         if (nt->tags.count >= nt->tags.capacity) {
@@ -789,32 +1046,31 @@ void mem_add_node(const char *id, const char *label, float x, float y, const cha
     }
 }
 
-void mem_add_edge(const char *src, const char *tgt) {
+void mem_add_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt) {
     EdgeSet *e = malloc(sizeof(EdgeSet));
     snprintf(e->key, sizeof(e->key), "%s|%s", src, tgt);
-    HASH_ADD_STR(edges_set, key, e);
+    HASH_ADD_STR(*edges_set, key, e);
 
-    if (edges_count >= edges_capacity) {
-        edges_capacity = edges_capacity ? edges_capacity*2 : 16;
-        edges_list = realloc(edges_list, edges_capacity * sizeof(Edge));
+    if (*edges_count >= *edges_capacity) {
+        *edges_capacity = *edges_capacity ? (*edges_capacity)*2 : 16;
+        *edges_list = realloc(*edges_list, (*edges_capacity) * sizeof(Edge));
     }
-    memset(&edges_list[edges_count], 0, sizeof(Edge));
-    strncpy(edges_list[edges_count].src, src, sizeof(edges_list[edges_count].src)-1);
-    strncpy(edges_list[edges_count].tgt, tgt, sizeof(edges_list[edges_count].tgt)-1);
-    edges_count++;
+    memset(&(*edges_list)[*edges_count], 0, sizeof(Edge));
+    strncpy((*edges_list)[*edges_count].src, src, sizeof((*edges_list)[*edges_count].src)-1);
+    strncpy((*edges_list)[*edges_count].tgt, tgt, sizeof((*edges_list)[*edges_count].tgt)-1);
+    (*edges_count)++;
 }
 
-void mem_add_tags(const char *node_id, const char **tags, int tag_count) {
+void mem_add_tags(NodeTags **tags_hash, const char *node_id, const char **tags, int tag_count) {
     NodeTags *nt = NULL;
-    HASH_FIND_STR(tags_hash, node_id, nt);
+    HASH_FIND_STR(*tags_hash, node_id, nt);
     if (!nt) {
         nt = malloc(sizeof(NodeTags));
         strncpy(nt->node_id, node_id, sizeof(nt->node_id)-1);
         nt->node_id[sizeof(nt->node_id)-1] = '\0';
-        nt->tags.count = 0;
-        nt->tags.capacity = 4;
+        nt->tags.count = 0; nt->tags.capacity = 4;
         nt->tags.tags = malloc(nt->tags.capacity * sizeof(char*));
-        HASH_ADD_STR(tags_hash, node_id, nt);
+        HASH_ADD_STR(*tags_hash, node_id, nt);
     }
     for (int i = 0; i < tag_count; i++) {
         if (nt->tags.count >= nt->tags.capacity) {
@@ -827,180 +1083,63 @@ void mem_add_tags(const char *node_id, const char **tags, int tag_count) {
     }
 }
 
-void rebuild_edge_list(void) {
-    free(edges_list);
-    edges_count = 0;
-    edges_capacity = 0;
-    edges_list = NULL;
+void rebuild_edge_list(EdgeSet *edges_set, Edge **edges_list, int *edges_count, int *edges_capacity) {
+    free(*edges_list);
+    *edges_count = 0; *edges_capacity = 0;
+    *edges_list = NULL;
     EdgeSet *e, *tmp;
     HASH_ITER(hh, edges_set, e, tmp) {
-        if (edges_count >= edges_capacity) {
-            edges_capacity = edges_capacity ? edges_capacity*2 : 16;
-            edges_list = realloc(edges_list, edges_capacity * sizeof(Edge));
+        if (*edges_count >= *edges_capacity) {
+            *edges_capacity = *edges_capacity ? (*edges_capacity)*2 : 16;
+            *edges_list = realloc(*edges_list, (*edges_capacity) * sizeof(Edge));
         }
-        memset(&edges_list[edges_count], 0, sizeof(Edge));
-        sscanf(e->key, "%[^|]|%[^|]", edges_list[edges_count].src, edges_list[edges_count].tgt);
-        edges_count++;
+        memset(&(*edges_list)[*edges_count], 0, sizeof(Edge));
+        sscanf(e->key, "%[^|]|%[^|]", (*edges_list)[*edges_count].src, (*edges_list)[*edges_count].tgt);
+        (*edges_count)++;
     }
 }
 
-void mem_delete_node(const char *node_id) {
+void mem_delete_node(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *node_id) {
     Node *node = NULL;
-    HASH_FIND_STR(nodes, node_id, node);
+    HASH_FIND_STR(*nodes, node_id, node);
     if (node) {
-        HASH_DEL(nodes, node);
+        HASH_DEL(*nodes, node);
         free(node->metadata);
         free(node);
     }
     NodeTags *nt = NULL;
-    HASH_FIND_STR(tags_hash, node_id, nt);
+    HASH_FIND_STR(*tags_hash, node_id, nt);
     if (nt) {
-        HASH_DEL(tags_hash, nt);
+        HASH_DEL(*tags_hash, nt);
         for (int i = 0; i < nt->tags.count; i++) free(nt->tags.tags[i]);
         free(nt->tags.tags);
         free(nt);
     }
     EdgeSet *e, *tmp;
-    HASH_ITER(hh, edges_set, e, tmp) {
+    HASH_ITER(hh, *edges_set, e, tmp) {
         char src[64], tgt[64];
         sscanf(e->key, "%[^|]|%[^|]", src, tgt);
         if (strcmp(src, node_id) == 0 || strcmp(tgt, node_id) == 0) {
-            HASH_DEL(edges_set, e);
+            HASH_DEL(*edges_set, e);
             free(e);
         }
     }
-    rebuild_edge_list();
+    rebuild_edge_list(*edges_set, edges_list, edges_count, edges_capacity);
 }
 
-void mem_delete_edge(const char *src, const char *tgt) {
+void mem_delete_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt) {
     char key[128];
     snprintf(key, sizeof(key), "%s|%s", src, tgt);
     EdgeSet *e = NULL;
-    HASH_FIND_STR(edges_set, key, e);
+    HASH_FIND_STR(*edges_set, key, e);
     if (e) {
-        HASH_DEL(edges_set, e);
+        HASH_DEL(*edges_set, e);
         free(e);
     }
-    rebuild_edge_list();
+    rebuild_edge_list(*edges_set, edges_list, edges_count, edges_capacity);
 }
 
-// ----------------------------- Force layout (with optional grid accel) ------
-void resolve_collisions(void) {
-    Node *n1, *n2;
-    for (n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-        for (n2 = n1->hh.next; n2 != NULL; n2 = n2->hh.next) {
-            float dx = n1->x - n2->x;
-            float dy = n1->y - n2->y;
-            float dist = sqrtf(dx*dx + dy*dy);
-            if (dist < MIN_DISTANCE && dist > 0.001f) {
-                float overlap = MIN_DISTANCE - dist;
-                float angle = atan2f(dy, dx);
-                float push_x = cosf(angle) * overlap * 0.5f;
-                float push_y = sinf(angle) * overlap * 0.5f;
-                n1->x += push_x;
-                n1->y += push_y;
-                n2->x -= push_x;
-                n2->y -= push_y;
-            }
-        }
-    }
-}
-
-void update_layout(void) {
-    if (HASH_COUNT(nodes) == 0) return;
-
-    // Reset forces
-    for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-        n1->fx = 0.0f;
-        n1->fy = 0.0f;
-    }
-
-    // ---- Repulsion ----
-    if (use_spatial_accel) {
-        // Grid‑based repulsion (O(N))
-        rebuild_grid();
-        int neighbors[9];
-        int neighbor_cnt;
-        for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-            int cx = coord_to_cell_x(n1->x);
-            int cy = coord_to_cell_y(n1->y);
-            if (cx < 0 || cx >= grid_width || cy < 0 || cy >= grid_height) continue;
-            get_neighbor_cells(cx, cy, neighbors, &neighbor_cnt);
-            for (int k = 0; k < neighbor_cnt; k++) {
-                GridCell *cell = &grid[neighbors[k]];
-                for (int i = 0; i < cell->count; i++) {
-                    Node *n2 = cell->nodes[i];
-                    if (n1 == n2) continue;
-                    float dx = n1->x - n2->x;
-                    float dy = n1->y - n2->y;
-                    float dist_sq = dx*dx + dy*dy + 1e-5f;
-                    float dist = sqrtf(dist_sq);
-                    float force = REPULSION_STRENGTH / dist_sq;
-                    float fx = (dx / dist) * force;
-                    float fy = (dy / dist) * force;
-                    n1->fx += fx;
-                    n2->fx -= fx;
-                    n1->fy += fy;
-                    n2->fy -= fy;
-                }
-            }
-        }
-    } else {
-        // Original O(N²) repulsion
-        for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-            for (Node *n2 = n1->hh.next; n2 != NULL; n2 = n2->hh.next) {
-                float dx = n1->x - n2->x;
-                float dy = n1->y - n2->y;
-                float dist_sq = dx*dx + dy*dy + 1e-5f;
-                float dist = sqrtf(dist_sq);
-                float force = REPULSION_STRENGTH / dist_sq;
-                float fx = (dx / dist) * force;
-                float fy = (dy / dist) * force;
-                n1->fx += fx;
-                n1->fy += fy;
-                n2->fx -= fx;
-                n2->fy -= fy;
-            }
-        }
-    }
-
-    // ---- Attraction (edges) - unchanged ----
-    for (int i = 0; i < edges_count; i++) {
-        Node *src = NULL, *tgt = NULL;
-        HASH_FIND_STR(nodes, edges_list[i].src, src);
-        HASH_FIND_STR(nodes, edges_list[i].tgt, tgt);
-        if (src && tgt) {
-            float dx = src->x - tgt->x;
-            float dy = src->y - tgt->y;
-            float dist = sqrtf(dx*dx + dy*dy) + 1e-5f;
-            float force = ATTRACTION_STRENGTH * (dist - DESIRED_EDGE_LENGTH);
-            float fx = (dx / dist) * force;
-            float fy = (dy / dist) * force;
-            src->fx -= fx;
-            src->fy -= fy;
-            tgt->fx += fx;
-            tgt->fy += fy;
-        }
-    }
-
-    // ---- Apply forces ----
-    for (Node *n1 = nodes; n1 != NULL; n1 = n1->hh.next) {
-        float fx = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fx));
-        float fy = fmaxf(-MAX_FORCE, fminf(MAX_FORCE, n1->fy));
-        n1->x += fx * TIME_STEP;
-        n1->y += fy * TIME_STEP;
-        n1->fx *= DAMPING;
-        n1->fy *= DAMPING;
-        if (use_cage) {
-            n1->x = fmaxf(50.0f, fminf(WINDOW_WIDTH - 50.0f, n1->x));
-            n1->y = fmaxf(50.0f, fminf(WINDOW_HEIGHT - 50.0f, n1->y));
-        }
-    }
-
-    if (use_collisions) resolve_collisions();
-}
-
-// ----------------------------- Initial data load  ---------------------------
+// ----------------------------- Initial data load ---------------------------
 void load_initial_data(void) {
     sqlite3_stmt *stmt;
     sqlite3_prepare_v2(db, "SELECT id, label, x, y, metadata FROM nodes", -1, &stmt, NULL);
@@ -1010,32 +1149,32 @@ void load_initial_data(void) {
         float x = (float)sqlite3_column_double(stmt, 2);
         float y = (float)sqlite3_column_double(stmt, 3);
         const char *metadata = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
-        mem_add_node(id, label, x, y, metadata, NULL, 0);
+        mem_add_node(&nodes_ui, &tags_hash_ui, id, label, x, y, metadata, NULL, 0);
     }
     sqlite3_finalize(stmt);
     sqlite3_prepare_v2(db, "SELECT source, target FROM edges", -1, &stmt, NULL);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *src = (const char*)sqlite3_column_text(stmt, 0);
         const char *tgt = (const char*)sqlite3_column_text(stmt, 1);
-        mem_add_edge(src, tgt);
+        mem_add_edge(&edges_set_ui, &edges_list_ui, &edges_count_ui, &edges_capacity_ui, src, tgt);
     }
     sqlite3_finalize(stmt);
     sqlite3_prepare_v2(db, "SELECT node_id, tag FROM node_tags", -1, &stmt, NULL);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *node_id = (const char*)sqlite3_column_text(stmt, 0);
         const char *tag = (const char*)sqlite3_column_text(stmt, 1);
-        mem_add_tags(node_id, &tag, 1);
+        mem_add_tags(&tags_hash_ui, node_id, &tag, 1);
     }
     sqlite3_finalize(stmt);
 }
 
 void add_sample_nodes(void) {
-    if (HASH_COUNT(nodes) == 0) {
+    if (HASH_COUNT(nodes_ui) == 0) {
         const char *meta = "{}";
         const char *tags1[] = {"sample"};
-        mem_add_node("sample1", "Node Alpha", -150.0f, -80.0f, meta, tags1, 1);
-        mem_add_node("sample2", "Node Beta", 180.0f, 90.0f, meta, tags1, 1);
-        mem_add_edge("sample1", "sample2");
+        mem_add_node(&nodes_ui, &tags_hash_ui, "sample1", "Node Alpha", -150.0f, -80.0f, meta, tags1, 1);
+        mem_add_node(&nodes_ui, &tags_hash_ui, "sample2", "Node Beta", 180.0f, 90.0f, meta, tags1, 1);
+        mem_add_edge(&edges_set_ui, &edges_list_ui, &edges_count_ui, &edges_capacity_ui, "sample1", "sample2");
         sqlite3_stmt *stmt;
         sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
         sqlite3_bind_text(stmt, 1, "sample1", -1, SQLITE_STATIC);
@@ -1079,16 +1218,18 @@ void parse_args(int argc, char **argv) {
         {"log-ui",   no_argument, 0, 'U'},
         {"ui-batch-size", required_argument, 0, 'b'},
         {"spatial",  no_argument, 0, 's'},
+        {"background-layout", no_argument, 0, 'B'},
         {0, 0, 0, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "HDUb:s", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "HDUb:sB", long_options, NULL)) != -1) {
         switch (c) {
             case 'H': log_http = true; break;
             case 'D': log_db = true; break;
             case 'U': log_ui = true; break;
             case 'b': ui_batch_size = atoi(optarg); if (ui_batch_size <= 0) ui_batch_size = DEFAULT_UI_BATCH_SIZE; break;
             case 's': use_spatial_accel = true; break;
+            case 'B': use_background_layout = true; break;
             default: break;
         }
     }
@@ -1125,7 +1266,7 @@ int main(int argc, char **argv) {
     sqlite3_exec(db, sql, NULL, NULL, &errmsg);
     if (errmsg) { fprintf(stderr, "SQL error: %s\n", errmsg); sqlite3_free(errmsg); }
 
-    // Load initial data into memory
+    // Load initial data into UI graph
     load_initial_data();
     add_sample_nodes();
 
@@ -1137,8 +1278,15 @@ int main(int argc, char **argv) {
     pthread_t http_thread;
     pthread_create(&http_thread, NULL, http_thread_func, NULL);
 
+    // Start background layout thread if requested
+    if (use_background_layout) {
+        pthread_t layout_thread;
+        pthread_create(&layout_thread, NULL, layout_thread_func, NULL);
+        if (log_ui) printf("Background layout thread started\n");
+    }
+
     // Initialize Raylib window
-    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Graph Visualizer (C) - Multi‑threaded");
+    InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Graph Visualizer - Multi‑threaded");
     SetTargetFPS(FPS_TARGET);
 
     Camera2D camera = { 0 };
@@ -1152,11 +1300,10 @@ int main(int argc, char **argv) {
 
     // Main loop
     while (!WindowShouldClose()) {
-        // Process UI messages in batches
+        // Process UI messages (including position updates)
         process_ui_messages(ui_batch_size);
 
         // --- Input Handling ---
-        // Pan with RIGHT mouse button (changed from MIDDLE)
         if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
             Vector2 delta = GetMouseDelta();
             camera.target.x -= delta.x / camera.zoom;
@@ -1169,10 +1316,10 @@ int main(int argc, char **argv) {
             if (camera.zoom > 5.0f) camera.zoom = 5.0f;
         }
         if (IsKeyPressed(KEY_R)) {
-            if (HASH_COUNT(nodes) > 0) {
+            if (HASH_COUNT(nodes_ui) > 0) {
                 float avg_x = 0, avg_y = 0;
-                Node *n; int count = 0;
-                for (n = nodes; n; n = n->hh.next) { avg_x += n->x; avg_y += n->y; count++; }
+                int count = 0;
+                for (Node *n = nodes_ui; n; n = n->hh.next) { avg_x += n->x; avg_y += n->y; count++; }
                 avg_x /= count; avg_y /= count;
                 camera.target = (Vector2){ avg_x, avg_y };
             } else camera.target = (Vector2){ 0, 0 };
@@ -1187,7 +1334,7 @@ int main(int argc, char **argv) {
         }
         if (search_active) {
             int key = GetCharPressed();
-            while (key > 0) {
+            while (key) {
                 if (key >= 32 && key <= 126) {
                     size_t len = strlen(search_text);
                     if (len < sizeof(search_text)-1) {
@@ -1206,35 +1353,38 @@ int main(int argc, char **argv) {
             Vector2 world = GetScreenToWorld2D(mouse, camera);
             float best_dist = NODE_RADIUS * 2;
             Node *best = NULL;
-            for (Node *n = nodes; n; n = n->hh.next) {
+            for (Node *n = nodes_ui; n; n = n->hh.next) {
                 float dist = sqrtf((n->x - world.x)*(n->x - world.x) + (n->y - world.y)*(n->y - world.y));
                 if (dist < best_dist) { best_dist = dist; best = n; }
             }
             selected_node = best;
         }
 
-        for (int i = 0; i < ITERATIONS_PER_FRAME && layout_enabled; i++)
-            update_layout();
+        // Synchronous layout only if background layout is not active
+        if (!use_background_layout && layout_enabled) {
+            for (int i = 0; i < ITERATIONS_PER_FRAME; i++)
+                compute_layout_iteration(nodes_ui, edges_list_ui, edges_count_ui, use_spatial_accel, use_cage, use_collisions);
+        }
 
         // --- Drawing ---
         BeginDrawing();
         ClearBackground(SOLARIZED_BASE03);
         BeginMode2D(camera);
 
-        for (int i = 0; i < edges_count; i++) {
+        for (int i = 0; i < edges_count_ui; i++) {
             Node *src = NULL, *tgt = NULL;
-            HASH_FIND_STR(nodes, edges_list[i].src, src);
-            HASH_FIND_STR(nodes, edges_list[i].tgt, tgt);
+            HASH_FIND_STR(nodes_ui, edges_list_ui[i].src, src);
+            HASH_FIND_STR(nodes_ui, edges_list_ui[i].tgt, tgt);
             if (src && tgt)
                 DrawLineEx((Vector2){ src->x, src->y }, (Vector2){ tgt->x, tgt->y }, 2.0f, EDGE_COLOR);
         }
 
         bool has_search = (strlen(search_text) > 0);
-        for (Node *n = nodes; n; n = n->hh.next) {
+        for (Node *n = nodes_ui; n; n = n->hh.next) {
             bool highlight = false;
             if (has_search) {
                 NodeTags *nt = NULL;
-                HASH_FIND_STR(tags_hash, n->id, nt);
+                HASH_FIND_STR(tags_hash_ui, n->id, nt);
                 if (nt) {
                     for (int i=0; i<nt->tags.count; i++)
                         if (strcmp(nt->tags.tags[i], search_text) == 0) { highlight = true; break; }
@@ -1256,11 +1406,16 @@ int main(int argc, char **argv) {
 
         EndMode2D();
 
+        // UI overlays
         DrawText(TextFormat("FPS: %d", GetFPS()), 10, 10, 20, WHITE);
         int y_off = 40;
-        DrawText(TextFormat("Nodes: %d", HASH_COUNT(nodes)), 10, y_off, 16, WHITE);
+        DrawText(TextFormat("Nodes: %d", HASH_COUNT(nodes_ui)), 10, y_off, 16, WHITE); y_off += 20;
+        if (!use_background_layout) {
+            DrawText(layout_enabled ? "[L] Layout: ON" : "[L] Layout: OFF", 10, y_off, 16, layout_enabled ? LIME : RED);
+        } else {
+            DrawText(layout_enabled ? "[L] Bg Layout: ON" : "[L] Bg Layout: OFF", 10, y_off, 16, layout_enabled ? LIME : RED);
+        }
         y_off += 20;
-        DrawText(layout_enabled ? "[L] Layout: ON" : "[L] Layout: OFF", 10, y_off, 16, layout_enabled ? LIME : RED); y_off += 20;
         DrawText(use_cage ? "[C] Cage: ON" : "[C] Cage: OFF (Infinity)", 10, y_off, 16, use_cage ? LIME : SKYBLUE); y_off += 20;
         DrawText(use_collisions ? "[X] Collisions: ON" : "[X] Collisions: OFF", 10, y_off, 16, use_collisions ? LIME : ORANGE);
         if (use_spatial_accel) {
@@ -1270,9 +1425,8 @@ int main(int argc, char **argv) {
         DrawText("[S] Search | [R] Reset | Right‑Mouse Pan | Scroll Zoom", 10, WINDOW_HEIGHT-30, 16, LIGHTGRAY);
 
         if (search_active) {
-            Rectangle bar = { 10, 140, 300, 30 };
-            DrawRectangleRec(bar, UI_BG_COLOR);
-            DrawRectangleLines(bar.x, bar.y, bar.width, bar.height, WHITE);
+            DrawRectangle(10, 140, 300, 30, UI_BG_COLOR);
+            DrawRectangleLines(10, 140, 300, 30, WHITE);
             char prompt[128];
             snprintf(prompt, sizeof(prompt), "Search tag: %s_", search_text);
             DrawText(prompt, 15, 145, 20, WHITE);
@@ -1280,8 +1434,7 @@ int main(int argc, char **argv) {
 
         if (selected_node) {
             int panel_w = 280, panel_h = 150;
-            int panel_x = WINDOW_WIDTH - panel_w - 10;
-            int panel_y = 10;
+            int panel_x = WINDOW_WIDTH - panel_w - 10, panel_y = 10;
             DrawRectangle(panel_x, panel_y, panel_w, panel_h, UI_BG_COLOR);
             DrawRectangleLines(panel_x, panel_y, panel_w, panel_h, WHITE);
             DrawText(TextFormat("ID: %s", selected_node->id), panel_x+5, panel_y+5, 14, WHITE);
@@ -1291,7 +1444,7 @@ int main(int argc, char **argv) {
             meta_short[40] = '\0';
             DrawText(TextFormat("Meta: %s", meta_short), panel_x+5, panel_y+45, 12, LIGHTGRAY);
             NodeTags *nt = NULL;
-            HASH_FIND_STR(tags_hash, selected_node->id, nt);
+            HASH_FIND_STR(tags_hash_ui, selected_node->id, nt);
             char tags_str[256] = "Tags: ";
             if (nt && nt->tags.count > 0) {
                 for (int i=0; i<nt->tags.count; i++) {

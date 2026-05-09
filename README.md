@@ -1,151 +1,249 @@
-# Realtime Graph Visualizer
+# Realtime Graph Visualizer (C Implementation)
 
-Just a graph visualizer realtime using Python + Raylib + API + SQLite
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![C](https://img.shields.io/badge/language-C-blue.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
+[![Raylib](https://img.shields.io/badge/graphics-raylib-green.svg)](https://www.raylib.com/)
+[![SQLite](https://img.shields.io/badge/database-SQLite-blue.svg)](https://www.sqlite.org/)
 
-## ✨ Overview
+A high‑performance, real‑time graph visualizer with an interactive force‑directed layout, HTTP API, and persistent storage. This **C version** is the main implementation – the original Python prototype has been fully rewritten in C for better speed and lower resource usage.
 
-This project is a real‑time, interactive graph visualizer that combines:
+![Good View](blob/good_view.jpg)  
+*Interactive graph layout with tag search, collision handling, and an “infinite canvas” mode.*
 
-* A **Raylib**‑powered 2D rendering window where nodes and edges are drawn and can be panned/zoomed.
-* An **HTTP API** (built with Flask) to add, remove and query nodes, edges and tags.
-* A **SQLite in‑memory database** that persists all changes, while the visualisation runs from fast in‑memory hash tables.
-* An **anti‑clustering force‑directed layout** that keeps nodes well spaced for readability.
+---
 
-## 🚀 Features
+## ✨ Features
 
-- **Real‑time updates** – add nodes and edges via simple `curl` commands and see them appear instantly.
-- **Interactive 2D view** – pan with middle‑click, zoom with scroll wheel, left‑click to select a node.
-- **Tagging system** – assign multiple tags to any node; search for nodes by tag (press `S`).
-- **Force‑directed layout** – nodes automatically arrange themselves; press `L` to freeze/unfreeze the layout.
-- **Metadata storage** – each node carries a JSON metadata field, shown when selected.
-- **Solarized Dark theme** – a calm, developer‑friendly colour scheme.
-- **Non‑blocking architecture** – a queue decouples the API threads from the drawing thread, ensuring smooth animation even under load.
+- **Force‑directed layout** – real‑time physical simulation (repulsion, attraction, damping).
+- **Interactive UI** – pan with middle mouse, zoom with scroll, select nodes by clicking.
+- **Tag search** – highlight nodes that contain a specific tag (press `S` to activate search).
+- **Toggleable options** – layout animation, collision resolution, infinite canvas (cage) mode.
+- **HTTP API** – RESTful endpoints to manage nodes, edges, and tags dynamically.
+- **Persistent storage** – SQLite (in‑memory by default, easily switched to a file).
+- **Multi‑threaded** – HTTP server runs on a separate thread; graph updates are queued and applied safely.
+- **Node metadata** – store arbitrary JSON metadata per node.
+- **Real‑time updates** – add, delete or modify elements via the API while the visualisation runs.
 
-## 📦 Requirements
+---
 
-- Python 3.12 or later
-- [uv](https://github.com/astral-sh/uv) (recommended) or `pip`
-- The following Python packages (automatically installed by `uv`):
-  - `raylib` – 2D graphics and input
-  - `flask` – REST API
-- On **NixOS** you need a shell that provides X11/OpenGL libraries (see the included `shell.nix`).
+## 📸 Screenshots
 
-## 🔧 Installation & Running
+| Simple example showing many nodes | Node detail panel and search |
+|-----------------------------------|------------------------------|
+| ![Simple Example](blob/simple_example.jpg) | ![Node panel](blob/good_view.jpg) |
 
-### Using `uv` (recommended)
+---
+
+## 🚀 Getting Started
+
+### Dependencies
+
+Make sure the following libraries are installed:
+
+- [raylib](https://www.raylib.com/) – graphics and input handling
+- [SQLite3](https://www.sqlite.org/) – node/edge/tag storage
+- [libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/) – HTTP server
+- [cJSON](https://github.com/DaveGamble/cJSON) – JSON parsing
+- [uthash](https://troydhanson.github.io/uthash/) – hash tables (header‑only)
+- pthreads – threading support
+
+On **NixOS** or with **nix**, you can use the provided `shell.nix`:
 
 ```bash
-# Clone the repository
-git clone https://github.com/haller33/RealtimeGraphVisualizer
-cd RealtimeGraphVisualizer
-
-# Run the visualizer (uv will fetch Python and all dependencies)
-uv run --with raylib --with flask python main.py
+nix-shell
 ```
 
-### Using `pip`
+### Build
+
+The project includes a simple `build.sh` script:
 
 ```bash
-# Create a virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install raylib flask
-
-# Run the program
-python main.py
+chmod +x build.sh
+./build.sh
 ```
 
-After startup you will see two sample nodes (`Node Alpha` and `Node Beta`) connected by an edge.  
-Your terminal will print:
+Or compile manually (example with `gcc`):
 
+```bash
+gcc -o graphviz main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm
 ```
-API server running on http://localhost:5000
+
+### Run
+
+```bash
+./graphviz
 ```
 
-Keep this terminal open while you use the visualizer.
+The visualisation window will open. The HTTP server starts automatically on port `5000`.
 
-## 📡 API Endpoints
+---
 
-All endpoints expect and return JSON unless noted otherwise.
+## 🎮 Keyboard & Mouse Controls
+
+| Action               | Control                          |
+|----------------------|----------------------------------|
+| **Pan**              | Middle mouse button + drag       |
+| **Zoom**             | Mouse wheel                      |
+| **Reset camera**     | `R`                              |
+| **Toggle layout**    | `L`                              |
+| **Toggle cage mode** | `C` (bounding box vs. infinite)  |
+| **Toggle collisions**| `X`                              |
+| **Search by tag**    | `S` (then type, press Enter)     |
+| **Select node**      | Left click                       |
+
+> **Cage mode OFF** – nodes can move anywhere (infinite canvas).  
+> **Cage mode ON** – nodes stay inside the window boundaries.
+
+---
+
+## 🌐 HTTP API
+
+The server listens on `http://localhost:5000`. All endpoints expect and return JSON.
+
+### Nodes
+
+| Method | Endpoint       | Description                      |
+|--------|----------------|----------------------------------|
+| `POST` | `/nodes`       | Create a new node                |
+| `GET`  | `/nodes`       | List all nodes (filter by `?tag=`) |
+| `DELETE` | `/nodes/{id}` | Delete a node and its edges      |
+
+**POST /nodes** example payload:
+
+```json
+{
+  "id": "node123",
+  "label": "My Node",
+  "metadata": { "type": "server", "value": 42 },
+  "tags": ["database", "critical"]
+}
+```
+
+**GET /nodes?tag=database** – returns nodes having that tag.
+
+### Edges
+
+| Method | Endpoint                     | Description                 |
+|--------|------------------------------|-----------------------------|
+| `POST` | `/edges`                     | Create an edge between two nodes |
+| `DELETE` | `/edges?source=A&target=B` | Delete a specific edge       |
+
+**POST /edges** payload:
+
+```json
+{
+  "source": "node123",
+  "target": "node456"
+}
+```
+
+### Tags
+
+| Method | Endpoint                    | Description                  |
+|--------|-----------------------------|------------------------------|
+| `POST` | `/nodes/{id}/tags`          | Add tags to an existing node |
+
+**POST /nodes/node123/tags** payload:
+
+```json
+{
+  "tags": ["newtag", "updated"]
+}
+```
+
+### Graph dump
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/nodes` | Add a node. Example: `{"id":"A","label":"Node A","tags":["test"],"metadata":{"color":"blue"}}` |
-| `POST` | `/edges` | Add an edge. Example: `{"source":"A","target":"B"}` |
-| `POST` | `/nodes/<id>/tags` | Add tags to an existing node. Example: `{"tags":["newtag","important"]}` |
-| `GET`  | `/nodes` | List all nodes (metadata is returned as a JSON object). |
-| `GET`  | `/nodes?tag=foo` | List nodes that contain the given tag. |
-| `GET`  | `/graph` | Get the full graph: `{"nodes":[...], "edges":[...]}`. |
-| `DELETE`| `/nodes/<id>` | Delete a node and all edges connected to it. |
-| `DELETE`| `/edges?source=A&target=B` | Delete a specific edge. |
+| `GET`  | `/graph` | Returns all nodes and edges in one object |
 
-### Example: adding a graph via `curl`
+---
+
+## 🗄️ Database
+
+By default, SQLite uses an **in‑memory** database (`file::memory:?cache=shared`).  
+To persist data across runs, change `DB_URI` in `main.c` to a file path (e.g. `"graph.db"`).
+
+Schema:
+
+- `nodes(id, label, x, y, metadata)`
+- `edges(source, target)`
+- `node_tags(node_id, tag)`
+
+All modifications via the HTTP API are written to the database **and** applied to the live visualisation.
+
+---
+
+## 🧪 Example Workflow
 
 ```bash
-# Add two nodes with tags
+# Add two nodes
 curl -X POST http://localhost:5000/nodes \
-     -H "Content-Type: application/json" \
-     -d '{"id":"A","label":"Node A","tags":["important","data"]}'
+  -H "Content-Type: application/json" \
+  -d '{"id":"A","label":"Alpha","tags":["group1"]}'
 
 curl -X POST http://localhost:5000/nodes \
-     -H "Content-Type: application/json" \
-     -d '{"id":"B","label":"Node B","metadata":{"type":"server"}}'
+  -H "Content-Type: application/json" \
+  -d '{"id":"B","label":"Beta","tags":["group1"]}'
 
 # Connect them
 curl -X POST http://localhost:5000/edges \
-     -H "Content-Type: application/json" \
-     -d '{"source":"A","target":"B"}'
+  -H "Content-Type: application/json" \
+  -d '{"source":"A","target":"B"}'
+
+# Search for "group1" in the visualiser (press S, type group1)
 ```
 
-## 🖱️ Interactive Controls (Raylib Window)
+The graph will immediately update with the new nodes and edge, and the layout simulation will adjust.
 
-| Control | Action |
-|---------|--------|
-| **Middle‑click + drag** | Pan the view |
-| **Scroll wheel** | Zoom in / out |
-| **Left‑click** on a node | Select the node – its metadata and tags appear in the top‑right panel |
-| `R` | Reset camera – centers on the average position of all nodes |
-| `L` | Toggle force‑directed layout (freeze/unfreeze) |
-| `S` | Activate search bar – type a tag name, press **Enter** to highlight all nodes with that tag (they turn purple) |
+---
 
-## 🧪 Testing
+## 🧠 Architecture
 
-A stress test script is provided:
+- **Main thread** – runs the raylib graphics loop, processes user input, and updates the force layout.
+- **HTTP thread** – runs libmicrohttpd, parses JSON, and pushes messages into a thread‑safe queue.
+- **Message queue** – holds `ADD_NODE`, `ADD_EDGE`, `DELETE_NODE`, etc. messages to avoid concurrent modification of the graph data.
+- **In‑memory structures** – nodes stored with uthash hash tables; edges stored in a hash set and a linear array for fast iteration.
+- **Force layout** – classical Fruchterman‑Reingold style with repulsion, attraction, damping, and optional collision resolution.
 
-```bash
-chmod +x stress_test.sh
-./stress_test.sh 200 20   # 200 requests, 20 parallel
+---
+
+## 📦 Project Structure
+
+```
+.
+├── main.c          – Single‑file implementation (graphics, HTTP, DB, layout)
+├── build.sh        – Quick build script (clang)
+├── shell.nix       – Nix development environment
+├── blob/           – Screenshot images
+│   ├── good_view.jpg
+│   └── simple_example.jpg
+└── README.md       – This file
 ```
 
-You can also run the full API test suite:
-
-```bash
-chmod +x test_api.sh
-./test_api.sh
-```
-
-## 🧬 Architecture Notes
-
-* The program uses **two threads**:
-  1. **Flask API** – receives HTTP requests, writes to the SQLite database, and pushes changes into a `queue.Queue`.
-  2. **Raylib drawing** – consumes the queue and updates fast in‑memory dictionaries (`nodes`, `edges`, `node_tags`). The drawing loop never touches the database, making it smooth and responsive.
-* The layout is a **spring‑embedder** (force‑directed) with:
-  * Stronger repulsion to prevent clustering.
-  * Weaker edge attraction to keep the graph readable.
-  * An extra collision‑resolution step that guarantees no two nodes overlap.
-
-## 💡 Tips
-
-* After adding many nodes via the API, press **`R`** to re‑center the camera.
-* If nodes fly away, press **`L`** to freeze the layout, pan/zoom to the graph, then press **`L`** again.
-* The `metadata` field can store any JSON data – it will be displayed when you click on a node.
-
-## 📄 License
-
-This project is open‑source under the [MIT License](LICENSE).
+---
 
 ## 🤝 Contributing
 
-Issues and pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
+Contributions are welcome! Please open an issue or pull request on the [GitHub repository](https://github.com/haller33/RealtimeGraphVisualizer).
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License.  
+See the [LICENSE](LICENSE) file for details.
+
+---
+
+## 🙏 Acknowledgements
+
+- [Raylib](https://www.raylib.com/) – simple and powerful graphics library.
+- [cJSON](https://github.com/DaveGamble/cJSON) – lightweight JSON parser.
+- [libmicrohttpd](https://www.gnu.org/software/libmicrohttpd/) – embedded HTTP server.
+- [uthash](https://troydhanson.github.io/uthash/) – convenient hash table macros.
+- The original Python prototype – inspiration for the features.
+
+---
+
+*Built with ❤️ in C*

@@ -2,7 +2,7 @@
 // Multi‑threaded with background layout using message passing (no shared graph).
 // UI thread owns one graph, layout thread owns another, synchronized via messages.
 // Compile: gcc -o graph_visualizer main.c -lraylib -lsqlite3 -lmicrohttpd -lcjson -lpthread -lm
-// Usage: ./graph_visualizer [--spatial] [--background-layout] [--layout-mode=force|tree|grid] [--log-http] [--log-db] [--log-ui] [--ui-batch-size N]
+// Usage: ./graph_visualizer [--db <file>] [--spatial] [--background-layout] [--layout-mode=force|tree|grid] [--log-http] [--log-db] [--log-ui] [--ui-batch-size N]
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -125,7 +125,7 @@ Edge *edges_list_layout = NULL;
 int edges_count_layout = 0, edges_capacity_layout = 0;
 
 // ----------------------------- Database -------------------------------------
-static const char *DB_URI = "file::memory:?cache=shared";
+static const char *db_uri = "file::memory:?cache=shared";   // default: in‑memory
 sqlite3 *db = NULL;
 
 // ----------------------------- Task queue for DB operations -----------------
@@ -472,7 +472,7 @@ void compute_layout_iteration(Node *nodes, Edge *edges_list, int edges_count, bo
 // ----------------------------- SQLite helpers (unchanged) -------------------
 sqlite3* get_db_conn(void) {
     sqlite3 *conn;
-    sqlite3_open(DB_URI, &conn);
+    sqlite3_open(db_uri, &conn);
     sqlite3_exec(conn, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
     return conn;
 }
@@ -1344,10 +1344,11 @@ void parse_args(int argc, char **argv) {
         {"spatial",  no_argument, 0, 's'},
         {"background-layout", no_argument, 0, 'B'},
         {"layout-mode", required_argument, 0, 'm'},
+        {"db",       required_argument, 0, 'd'},
         {0, 0, 0, 0}
     };
     int c;
-    while ((c = getopt_long(argc, argv, "HDUb:sBm:", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "HDUb:sBm:d:", long_options, NULL)) != -1) {
         switch (c) {
             case 'H': log_http = true; break;
             case 'D': log_db = true; break;
@@ -1360,6 +1361,9 @@ void parse_args(int argc, char **argv) {
                 else if (strcmp(optarg, "grid") == 0) layout_mode = LAYOUT_GRID;
                 else layout_mode = LAYOUT_FORCE;
                 break;
+            case 'd':
+                db_uri = optarg;
+                break;
             default: break;
         }
     }
@@ -1371,7 +1375,7 @@ int main(int argc, char **argv) {
     srand((unsigned)time(NULL));
 
     // Open database and create schema
-    sqlite3_open(DB_URI, &db);
+    sqlite3_open(db_uri, &db);
     sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
     const char *sql =
         "CREATE TABLE IF NOT EXISTS nodes ("

@@ -25,6 +25,7 @@
 #define WINDOW_HEIGHT 720
 #define FPS_TARGET    60
 #define DEFAULT_UI_BATCH_SIZE 5
+#define MAX_HTTP_PAYLOAD 1048576   // 1 MB limit for HTTP POST body
 
 // Force layout parameters
 #define REPULSION_STRENGTH      2500.0f
@@ -69,6 +70,9 @@ bool log_db = false;
 bool log_ui = false;
 int ui_batch_size = DEFAULT_UI_BATCH_SIZE;
 
+// ----------------------------- Global shutdown flag -------------------------
+volatile bool is_running = true;   // set to false to stop all threads
+
 // ----------------------------- Graph structures (shared type definitions) ---
 typedef struct Node {
     char id[64];
@@ -109,6 +113,8 @@ void mem_delete_node(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set, Ed
 void mem_delete_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt);
 void rebuild_edge_list(EdgeSet *edges_set, Edge **edges_list, int *edges_count, int *edges_capacity);
 void compute_layout_iteration(Node *nodes, Edge *edges_list, int edges_count, bool use_spatial, bool use_cage_flag, bool use_collisions_flag);
+void free_all_graph(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set);
+void free_all_queue_items(void);
 
 // ----------------------------- UI thread’s graph ----------------------------
 Node *nodes_ui = NULL;
@@ -614,7 +620,11 @@ void enqueue_task(DBTask *task) {
 
 DBTask* dequeue_task(void) {
     pthread_mutex_lock(&task_mutex);
-    while (!task_head) pthread_cond_wait(&task_cond, &task_mutex);
+    while (!task_head && is_running) pthread_cond_wait(&task_cond, &task_mutex);
+    if (!task_head && !is_running) {
+        pthread_mutex_unlock(&task_mutex);
+        return NULL;
+    }
     DBTask *task = task_head;
     task_head = task->next;
     if (!task_head) task_tail = NULL;
@@ -661,11 +671,14 @@ void enqueue_layout_update(LayoutUpdate *upd) {
 
 LayoutUpdate* dequeue_layout_update(void) {
     pthread_mutex_lock(&layout_update_mutex);
-    LayoutUpdate *upd = layout_update_head;
-    if (upd) {
-        layout_update_head = upd->next;
-        if (!layout_update_head) layout_update_tail = NULL;
+    while (!layout_update_head && is_running) pthread_cond_wait(&layout_update_cond, &layout_update_mutex);
+    if (!layout_update_head && !is_running) {
+        pthread_mutex_unlock(&layout_update_mutex);
+        return NULL;
     }
+    LayoutUpdate *upd = layout_update_head;
+    layout_update_head = upd->next;
+    if (!layout_update_head) layout_update_tail = NULL;
     pthread_mutex_unlock(&layout_update_mutex);
     return upd;
 }
@@ -703,19 +716,22 @@ void apply_layout_update_to_back(LayoutUpdate *upd) {
             mem_add_edge(&edges_set_layout, &edges_list_layout, &edges_count_layout, &edges_capacity_layout, upd->id1, upd->id2);
             break;
         case TASK_ADD_TAGS: {
-            char *copy = strdup(upd->tags_str);
-            char *token = strtok(copy, ",");
-            const char **tags = NULL;
-            int cnt = 0;
-            while (token) {
-                tags = realloc(tags, (cnt+1)*sizeof(const char*));
-                tags[cnt++] = strdup(token);
-                token = strtok(NULL, ",");
+            // Guard against NULL tags_str
+            if (upd->tags_str && strlen(upd->tags_str) > 0) {
+                char *copy = strdup(upd->tags_str);
+                char *token = strtok(copy, ",");
+                const char **tags = NULL;
+                int cnt = 0;
+                while (token) {
+                    tags = realloc(tags, (cnt+1)*sizeof(const char*));
+                    tags[cnt++] = strdup(token);
+                    token = strtok(NULL, ",");
+                }
+                mem_add_tags(&tags_hash_layout, upd->id1, tags, cnt);
+                for (int i=0; i<cnt; i++) free((void*)tags[i]);
+                free(tags);
+                free(copy);
             }
-            mem_add_tags(&tags_hash_layout, upd->id1, tags, cnt);
-            for (int i=0; i<cnt; i++) free((void*)tags[i]);
-            free(tags);
-            free(copy);
             break;
         }
         case TASK_DELETE_NODE:
@@ -774,24 +790,27 @@ void process_ui_messages(int max_count) {
                 break;
             }
             case TASK_ADD_TAGS: {
-                char *copy = strdup(msg->tags_str);
-                char *token = strtok(copy, ",");
-                const char **tags = NULL;
-                int cnt = 0;
-                while (token) {
-                    tags = realloc(tags, (cnt+1)*sizeof(const char*));
-                    tags[cnt++] = strdup(token);
-                    token = strtok(NULL, ",");
+                // Guard against NULL tags_str
+                if (msg->tags_str && strlen(msg->tags_str) > 0) {
+                    char *copy = strdup(msg->tags_str);
+                    char *token = strtok(copy, ",");
+                    const char **tags = NULL;
+                    int cnt = 0;
+                    while (token) {
+                        tags = realloc(tags, (cnt+1)*sizeof(const char*));
+                        tags[cnt++] = strdup(token);
+                        token = strtok(NULL, ",");
+                    }
+                    mem_add_tags(&tags_hash_ui, msg->id1, tags, cnt);
+                    LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
+                    upd->type = TASK_ADD_TAGS;
+                    strcpy(upd->id1, msg->id1);
+                    if (msg->tags_str) upd->tags_str = strdup(msg->tags_str);
+                    enqueue_layout_update(upd);
+                    for (int i=0; i<cnt; i++) free((void*)tags[i]);
+                    free(tags);
+                    free(copy);
                 }
-                mem_add_tags(&tags_hash_ui, msg->id1, tags, cnt);
-                LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
-                upd->type = TASK_ADD_TAGS;
-                strcpy(upd->id1, msg->id1);
-                if (msg->tags_str) upd->tags_str = strdup(msg->tags_str);
-                enqueue_layout_update(upd);
-                for (int i=0; i<cnt; i++) free((void*)tags[i]);
-                free(tags);
-                free(copy);
                 if (log_ui) printf("UI: added tags to %s\n", msg->id1);
                 break;
             }
@@ -840,7 +859,7 @@ void* db_thread_func(void *arg) {
     if (log_db) printf("DB thread started\n");
     // Open a single connection for the lifetime of this thread
     sqlite3 *conn = get_db_conn();
-    while (1) {
+    while (is_running) {
         DBTask *task = dequeue_task();
         if (!task) continue;
         switch (task->type) {
@@ -880,7 +899,7 @@ void* layout_thread_func(void *arg) {
                      edges_list_ui[i].src, edges_list_ui[i].tgt);
     }
 
-    while (1) {
+    while (is_running) {
         LayoutUpdate *upd;
         while ((upd = dequeue_layout_update()) != NULL) {
             apply_layout_update_to_back(upd);
@@ -914,7 +933,7 @@ void* layout_thread_func(void *arg) {
     return NULL;
 }
 
-// ----------------------------- HTTP Server (unchanged) ----------------------
+// ----------------------------- HTTP Server ----------------------------------
 static struct MHD_Daemon *http_daemon = NULL;
 
 typedef struct {
@@ -954,6 +973,14 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
             return MHD_YES;
         }
         if (*upload_data_size > 0) {
+            // Check payload size limit to prevent memory exhaustion
+            if (state->size + *upload_data_size > MAX_HTTP_PAYLOAD) {
+                if (log_http) fprintf(stderr, "HTTP payload too large, aborting\n");
+                if (state->payload) free(state->payload);
+                free(state);
+                *con_cls = NULL;
+                return MHD_NO;
+            }
             state->payload = realloc(state->payload, state->size + *upload_data_size + 1);
             memcpy(state->payload + state->size, upload_data, *upload_data_size);
             state->size += *upload_data_size;
@@ -1173,39 +1200,42 @@ void* http_thread_func(void *arg) {
                                    MHD_OPTION_NOTIFY_COMPLETED, &request_completed, NULL, MHD_OPTION_END);
     if (!http_daemon) { fprintf(stderr, "Failed to start HTTP server on 5000\n"); exit(1); }
     printf("API server running on http://localhost:5000\n");
-    while (1) sleep(1);
+    while (is_running) sleep(1);
+    MHD_stop_daemon(http_daemon);
     return NULL;
 }
 
 // ----------------------------- Graph helpers (definitions) ------------------
 void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count) {
+    Node *existing = NULL;
+    HASH_FIND_STR(*nodes, id, existing);
+    if (existing) {
+        // Update existing node: free old metadata, update fields, add new tags
+        free(existing->metadata);
+        existing->metadata = strdup(metadata);
+        strncpy(existing->label, label, sizeof(existing->label)-1);
+        existing->label[sizeof(existing->label)-1] = '\0';
+        existing->x = x;
+        existing->y = y;
+        // Add any new tags
+        if (tag_count > 0 && tags) {
+            mem_add_tags(tags_hash, id, tags, tag_count);
+        }
+        return;
+    }
+
+    // Create new node
     Node *node = malloc(sizeof(Node));
     strncpy(node->id, id, sizeof(node->id)-1); node->id[sizeof(node->id)-1] = '\0';
     strncpy(node->label, label, sizeof(node->label)-1); node->label[sizeof(node->label)-1] = '\0';
     node->x = x; node->y = y;
     node->fx = node->fy = 0.0f;
-    node->metadata = malloc(strlen(metadata)+1);
-    strcpy(node->metadata, metadata);
+    node->metadata = strdup(metadata);
     HASH_ADD_STR(*nodes, id, node);
 
-    NodeTags *nt = NULL;
-    HASH_FIND_STR(*tags_hash, id, nt);
-    if (!nt) {
-        nt = malloc(sizeof(NodeTags));
-        strncpy(nt->node_id, id, sizeof(nt->node_id)-1);
-        nt->node_id[sizeof(nt->node_id)-1] = '\0';
-        nt->tags.count = 0; nt->tags.capacity = 4;
-        nt->tags.tags = malloc(nt->tags.capacity * sizeof(char*));
-        HASH_ADD_STR(*tags_hash, node_id, nt);
-    }
-    for (int i = 0; i < tag_count; i++) {
-        if (nt->tags.count >= nt->tags.capacity) {
-            nt->tags.capacity *= 2;
-            nt->tags.tags = realloc(nt->tags.tags, nt->tags.capacity * sizeof(char*));
-        }
-        nt->tags.tags[nt->tags.count] = malloc(strlen(tags[i])+1);
-        strcpy(nt->tags.tags[nt->tags.count], tags[i]);
-        nt->tags.count++;
+    // Handle tags
+    if (tag_count > 0 && tags) {
+        mem_add_tags(tags_hash, id, tags, tag_count);
     }
 }
 
@@ -1236,12 +1266,21 @@ void mem_add_tags(NodeTags **tags_hash, const char *node_id, const char **tags, 
         HASH_ADD_STR(*tags_hash, node_id, nt);
     }
     for (int i = 0; i < tag_count; i++) {
+        // Check for duplicate tag
+        bool duplicate = false;
+        for (int j = 0; j < nt->tags.count; j++) {
+            if (strcmp(nt->tags.tags[j], tags[i]) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
         if (nt->tags.count >= nt->tags.capacity) {
             nt->tags.capacity *= 2;
             nt->tags.tags = realloc(nt->tags.tags, nt->tags.capacity * sizeof(char*));
         }
-        nt->tags.tags[nt->tags.count] = malloc(strlen(tags[i])+1);
-        strcpy(nt->tags.tags[nt->tags.count], tags[i]);
+        nt->tags.tags[nt->tags.count] = strdup(tags[i]);
         nt->tags.count++;
     }
 }
@@ -1300,6 +1339,64 @@ void mem_delete_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, i
         free(e);
     }
     rebuild_edge_list(*edges_set, edges_list, edges_count, edges_capacity);
+}
+
+// ----------------------------- Helper: free all graph memory ----------------
+void free_all_graph(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set) {
+    Node *cur_node, *tmp_node;
+    HASH_ITER(hh, *nodes, cur_node, tmp_node) {
+        HASH_DEL(*nodes, cur_node);
+        free(cur_node->metadata);
+        free(cur_node);
+    }
+    NodeTags *cur_nt, *tmp_nt;
+    HASH_ITER(hh, *tags_hash, cur_nt, tmp_nt) {
+        HASH_DEL(*tags_hash, cur_nt);
+        for (int i = 0; i < cur_nt->tags.count; i++) free(cur_nt->tags.tags[i]);
+        free(cur_nt->tags.tags);
+        free(cur_nt);
+    }
+    EdgeSet *cur_edge, *tmp_edge;
+    HASH_ITER(hh, *edges_set, cur_edge, tmp_edge) {
+        HASH_DEL(*edges_set, cur_edge);
+        free(cur_edge);
+    }
+}
+
+void free_all_queue_items(void) {
+    // Free any pending DBTasks
+    DBTask *task = task_head;
+    while (task) {
+        DBTask *next = task->next;
+        if (task->metadata) free(task->metadata);
+        if (task->tags_str) free(task->tags_str);
+        free(task);
+        task = next;
+    }
+    task_head = task_tail = NULL;
+
+    // Free any pending UIMsgs
+    UIMsg *msg = ui_head;
+    while (msg) {
+        UIMsg *next = msg->next;
+        if (msg->metadata) free(msg->metadata);
+        if (msg->tags_str) free(msg->tags_str);
+        if (msg->pos_updates) free(msg->pos_updates);
+        free(msg);
+        msg = next;
+    }
+    ui_head = ui_tail = NULL;
+
+    // Free any pending LayoutUpdates
+    LayoutUpdate *upd = layout_update_head;
+    while (upd) {
+        LayoutUpdate *next = upd->next;
+        if (upd->metadata) free(upd->metadata);
+        if (upd->tags_str) free(upd->tags_str);
+        free(upd);
+        upd = next;
+    }
+    layout_update_head = layout_update_tail = NULL;
 }
 
 // ----------------------------- Initial data load ---------------------------
@@ -1462,8 +1559,8 @@ int main(int argc, char **argv) {
     pthread_t http_thread;
     pthread_create(&http_thread, NULL, http_thread_func, NULL);
 
+    pthread_t layout_thread;
     if (use_background_layout) {
-        pthread_t layout_thread;
         pthread_create(&layout_thread, NULL, layout_thread_func, NULL);
         if (log_ui) printf("Background layout thread started\n");
     }
@@ -1633,6 +1730,30 @@ int main(int argc, char **argv) {
 
         EndDrawing();
     }
+
+    // ---------- Graceful shutdown ----------
+    is_running = false;
+    // Wake up threads waiting on condition variables
+    pthread_cond_broadcast(&task_cond);
+    pthread_cond_broadcast(&layout_update_cond);
+
+    // Join threads
+    pthread_join(db_thread, NULL);
+    pthread_join(http_thread, NULL);
+    if (use_background_layout) pthread_join(layout_thread, NULL);
+
+    // Free any remaining queued items
+    free_all_queue_items();
+
+    // Free UI graph memory
+    free_all_graph(&nodes_ui, &tags_hash_ui, &edges_set_ui);
+    // Free layout graph memory (if background layout was used)
+    if (use_background_layout) {
+        free_all_graph(&nodes_layout, &tags_hash_layout, &edges_set_layout);
+    }
+    // Free edges_list arrays
+    if (edges_list_ui) free(edges_list_ui);
+    if (edges_list_layout) free(edges_list_layout);
 
     MHD_stop_daemon(http_daemon);
     sqlite3_close(db);

@@ -80,6 +80,7 @@ typedef struct Node {
     float x, y;
     float fx, fy;        // force vectors (only used by layout thread)
     char *metadata;
+    char color[16]; // node colour (hex string) or empty
     UT_hash_handle hh;
 } Node;
 
@@ -106,7 +107,7 @@ typedef struct Edge {
 } Edge;
 
 // Forward declarations for graph helpers
-void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count);
+void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char *color, const char **tags, int tag_count);
 void mem_add_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt);
 void mem_add_tags(NodeTags **tags_hash, const char *node_id, const char **tags, int tag_count);
 void mem_delete_node(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *node_id);
@@ -149,6 +150,7 @@ typedef struct DBTask {
     char id1[64];
     char id2[64];
     char *metadata;
+    char color[16]; // optional hex color string, e.g. "#ffaa33"
     char *tags_str;
     struct DBTask *next;
 } DBTask;
@@ -163,6 +165,7 @@ typedef struct UIMsg {
     char id1[64];
     char id2[64];
     char *metadata;
+    char color[16]; // colour supplied by the API / UI
     char *tags_str;
     int pos_count;                 // for TASK_POSITION_UPDATE
     struct { char id[64]; float x, y; } *pos_updates; // flexible array
@@ -178,6 +181,7 @@ typedef struct LayoutUpdate {
     char id1[64];
     char id2[64];
     char *metadata;
+    char color[16]; // colour for node addition
     char *tags_str;
     float x, y;                     // coordinates for ADD_NODE
     struct LayoutUpdate *next;
@@ -537,9 +541,8 @@ sqlite3* get_db_conn(void) {
 }
 
 void db_insert_node_task(DBTask *task, sqlite3 *conn) {
-    // Use the given persistent connection
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(conn, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
+    sqlite3_prepare_v2(conn, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata, color) VALUES (?,?,?,?,?,?)", -1, &stmt, NULL);
     float x = (float)((rand() % 1000) - 500);
     float y = (float)((rand() % 1000) - 500);
     sqlite3_bind_text(stmt, 1, task->id1, -1, SQLITE_STATIC);
@@ -547,6 +550,7 @@ void db_insert_node_task(DBTask *task, sqlite3 *conn) {
     sqlite3_bind_double(stmt, 3, x);
     sqlite3_bind_double(stmt, 4, y);
     sqlite3_bind_text(stmt, 5, task->metadata, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 6, task->color[0] != '\0' ? task->color : NULL, -1, SQLITE_STATIC);
     if (sqlite3_step(stmt) != SQLITE_DONE && log_db)
         fprintf(stderr, "DB: insert node failed: %s\n", sqlite3_errmsg(conn));
     sqlite3_finalize(stmt);
@@ -707,7 +711,8 @@ void apply_layout_update_to_back(LayoutUpdate *upd) {
             // Use the coordinates from the UI message instead of random
             float x = upd->x;
             float y = upd->y;
-            mem_add_node(&nodes_layout, &tags_hash_layout, upd->id1, upd->id2, x, y, upd->metadata, tags, tag_cnt);
+            const char *color = upd->color[0] != '\0' ? upd->color : NULL;
+            mem_add_node(&nodes_layout, &tags_hash_layout, upd->id1, upd->id2, x, y, upd->metadata, color, tags, tag_cnt);
             for (int i=0; i<tag_cnt; i++) free((void*)tags[i]);
             free(tags);
             break;
@@ -765,13 +770,13 @@ void process_ui_messages(int max_count) {
                 }
                 float x = (float)((rand() % 1000) - 500);
                 float y = (float)((rand() % 1000) - 500);
-                mem_add_node(&nodes_ui, &tags_hash_ui, msg->id1, msg->id2, x, y, msg->metadata, tags, tag_cnt);
-                // Also send to layout thread, including the exact coordinates
+                mem_add_node(&nodes_ui, &tags_hash_ui, msg->id1, msg->id2, x, y, msg->metadata, msg->color, tags, tag_cnt);
                 LayoutUpdate *upd = calloc(1, sizeof(LayoutUpdate));
                 upd->type = TASK_ADD_NODE;
                 strcpy(upd->id1, msg->id1); strcpy(upd->id2, msg->id2);
                 if (msg->metadata) upd->metadata = strdup(msg->metadata);
                 if (msg->tags_str) upd->tags_str = strdup(msg->tags_str);
+                if (msg->color[0] != '\0') strcpy(upd->color, msg->color);
                 upd->x = x;
                 upd->y = y;
                 enqueue_layout_update(upd);
@@ -875,6 +880,7 @@ void* db_thread_func(void *arg) {
             uimsg->type = task->type;
             strcpy(uimsg->id1, task->id1); strcpy(uimsg->id2, task->id2);
             if (task->metadata) uimsg->metadata = strdup(task->metadata);
+            if (task->color[0] != '\0') strcpy(uimsg->color, task->color);
             if (task->tags_str) uimsg->tags_str = strdup(task->tags_str);
             enqueue_ui_msg(uimsg);
         }
@@ -892,7 +898,7 @@ void* layout_thread_func(void *arg) {
     if (log_ui) printf("Layout thread started\n");
 
     for (Node *n = nodes_ui; n; n = n->hh.next) {
-        mem_add_node(&nodes_layout, &tags_hash_layout, n->id, n->label, n->x, n->y, n->metadata, NULL, 0);
+        mem_add_node(&nodes_layout, &tags_hash_layout, n->id, n->label, n->x, n->y, n->metadata, n->color, NULL, 0);
     }
     for (int i = 0; i < edges_count_ui; i++) {
         mem_add_edge(&edges_set_layout, &edges_list_layout, &edges_count_layout, &edges_capacity_layout,
@@ -1029,12 +1035,22 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
                 tags_buf = strdup("");
             }
 
+            const char *color_str = NULL;
+            if (cJSON_GetObjectItemCaseSensitive(json, "color")) {
+                color_str = cJSON_GetObjectItemCaseSensitive(json, "color")->valuestring;
+            }
             DBTask *task = calloc(1, sizeof(DBTask));
             task->type = TASK_ADD_NODE;
             strncpy(task->id1, id_str, sizeof(task->id1)-1);
             strncpy(task->id2, label_str, sizeof(task->id2)-1);
             task->metadata = meta_str;
             task->tags_str = tags_buf;
+            if (color_str) {
+                strncpy(task->color, color_str, sizeof(task->color)-1);
+                task->color[sizeof(task->color)-1] = '\0';
+            } else {
+                task->color[0] = '\0';
+            }
             enqueue_task(task);
 
             free((void*)tag_arr);
@@ -1139,7 +1155,8 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
                 cJSON_AddStringToObject(obj, "label", (const char*)sqlite3_column_text(stmt, 1));
                 cJSON_AddNumberToObject(obj, "x", sqlite3_column_double(stmt, 2));
                 cJSON_AddNumberToObject(obj, "y", sqlite3_column_double(stmt, 3));
-                const char *meta = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
+                const char *tmp = (const char*) sqlite3_column_text(stmt, 4);
+                const char *meta = tmp[0] != '\0' ? tmp : "{}";
                 cJSON *meta_json = cJSON_Parse(meta);
                 if (!meta_json) meta_json = cJSON_CreateObject();
                 cJSON_AddItemToObject(obj, "metadata", meta_json);
@@ -1166,7 +1183,8 @@ enum MHD_Result handle_request(void *cls, struct MHD_Connection *connection,
                 cJSON_AddStringToObject(obj, "label", (const char*)sqlite3_column_text(stmt, 1));
                 cJSON_AddNumberToObject(obj, "x", sqlite3_column_double(stmt, 2));
                 cJSON_AddNumberToObject(obj, "y", sqlite3_column_double(stmt, 3));
-                const char *meta = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
+                const char *tmp = (const char*)sqlite3_column_text(stmt, 4);
+                const char *meta = tmp[0] != '\0' ? tmp : "{}";
                 cJSON *meta_json = cJSON_Parse(meta);
                 if (!meta_json) meta_json = cJSON_CreateObject();
                 cJSON_AddItemToObject(obj, "metadata", meta_json);
@@ -1206,7 +1224,7 @@ void* http_thread_func(void *arg) {
 }
 
 // ----------------------------- Graph helpers (definitions) ------------------
-void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char **tags, int tag_count) {
+void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char *label, float x, float y, const char *metadata, const char *color, const char **tags, int tag_count) {
     Node *existing = NULL;
     HASH_FIND_STR(*nodes, id, existing);
     if (existing) {
@@ -1218,6 +1236,7 @@ void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char
         existing->x = x;
         existing->y = y;
         // Add any new tags
+        if (color) strncpy(existing->color, color, sizeof(existing->color)-1);
         if (tag_count > 0 && tags) {
             mem_add_tags(tags_hash, id, tags, tag_count);
         }
@@ -1231,6 +1250,7 @@ void mem_add_node(Node **nodes, NodeTags **tags_hash, const char *id, const char
     node->x = x; node->y = y;
     node->fx = node->fy = 0.0f;
     node->metadata = strdup(metadata);
+    if (color) strncpy(node->color, color, sizeof(node->color)-1); else node->color[0] = '\0';
     HASH_ADD_STR(*nodes, id, node);
 
     // Handle tags
@@ -1330,7 +1350,7 @@ void mem_delete_node(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set, Ed
 }
 
 void mem_delete_edge(EdgeSet **edges_set, Edge **edges_list, int *edges_count, int *edges_capacity, const char *src, const char *tgt) {
-    char key[256];  // Increased buffer
+    char key[256];
     snprintf(key, sizeof(key), "%s|%s", src, tgt);
     EdgeSet *e = NULL;
     HASH_FIND_STR(*edges_set, key, e);
@@ -1364,7 +1384,6 @@ void free_all_graph(Node **nodes, NodeTags **tags_hash, EdgeSet **edges_set) {
 }
 
 void free_all_queue_items(void) {
-    // Free any pending DBTasks
     DBTask *task = task_head;
     while (task) {
         DBTask *next = task->next;
@@ -1375,7 +1394,6 @@ void free_all_queue_items(void) {
     }
     task_head = task_tail = NULL;
 
-    // Free any pending UIMsgs
     UIMsg *msg = ui_head;
     while (msg) {
         UIMsg *next = msg->next;
@@ -1387,7 +1405,6 @@ void free_all_queue_items(void) {
     }
     ui_head = ui_tail = NULL;
 
-    // Free any pending LayoutUpdates
     LayoutUpdate *upd = layout_update_head;
     while (upd) {
         LayoutUpdate *next = upd->next;
@@ -1402,14 +1419,16 @@ void free_all_queue_items(void) {
 // ----------------------------- Initial data load ---------------------------
 void load_initial_data(void) {
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(db, "SELECT id, label, x, y, metadata FROM nodes", -1, &stmt, NULL);
+    sqlite3_prepare_v2(db, "SELECT id, label, x, y, metadata, color FROM nodes", -1, &stmt, NULL);
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *id = (const char*)sqlite3_column_text(stmt, 0);
         const char *label = (const char*)sqlite3_column_text(stmt, 1);
         float x = (float)sqlite3_column_double(stmt, 2);
         float y = (float)sqlite3_column_double(stmt, 3);
-        const char *metadata = (const char*)sqlite3_column_text(stmt, 4) ?: "{}";
-        mem_add_node(&nodes_ui, &tags_hash_ui, id, label, x, y, metadata, NULL, 0);
+        const char *tmp = (const char*)sqlite3_column_text(stmt, 4);
+        const char *metadata = tmp[0] != '\0' ? tmp : "{}";
+        const char *color = (const char*)sqlite3_column_text(stmt, 5);
+        mem_add_node(&nodes_ui, &tags_hash_ui, id, label, x, y, metadata, color, NULL, 0);
     }
     sqlite3_finalize(stmt);
     sqlite3_prepare_v2(db, "SELECT source, target FROM edges", -1, &stmt, NULL);
@@ -1432,24 +1451,26 @@ void add_sample_nodes(void) {
     if (HASH_COUNT(nodes_ui) == 0) {
         const char *meta = "{}";
         const char *tags1[] = {"sample"};
-        mem_add_node(&nodes_ui, &tags_hash_ui, "sample1", "Node Alpha", -150.0f, -80.0f, meta, tags1, 1);
-        mem_add_node(&nodes_ui, &tags_hash_ui, "sample2", "Node Beta", 180.0f, 90.0f, meta, tags1, 1);
+        mem_add_node(&nodes_ui, &tags_hash_ui, "sample1", "Node Alpha", -150.0f, -80.0f, meta, "#66bfff",tags1, 1);
+        mem_add_node(&nodes_ui, &tags_hash_ui, "sample2", "Node Beta", 180.0f, 90.0f, meta, "#66bfff",tags1, 1);
         mem_add_edge(&edges_set_ui, &edges_list_ui, &edges_count_ui, &edges_capacity_ui, "sample1", "sample2");
         sqlite3_stmt *stmt;
-        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata, color) VALUES (?,?,?,?,?,?)", -1, &stmt, NULL);
         sqlite3_bind_text(stmt, 1, "sample1", -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 2, "Node Alpha", -1, SQLITE_STATIC);
         sqlite3_bind_double(stmt, 3, -150.0);
         sqlite3_bind_double(stmt, 4, -80.0);
         sqlite3_bind_text(stmt, 5, meta, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 6, "#ff5555", -1, SQLITE_STATIC);
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
-        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata) VALUES (?,?,?,?,?)", -1, &stmt, NULL);
+        sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO nodes (id, label, x, y, metadata, color) VALUES (?,?,?,?,?,?)", -1, &stmt, NULL);
         sqlite3_bind_text(stmt, 1, "sample2", -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 2, "Node Beta", -1, SQLITE_STATIC);
         sqlite3_bind_double(stmt, 3, 180.0);
         sqlite3_bind_double(stmt, 4, 90.0);
         sqlite3_bind_text(stmt, 5, meta, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 6, "#55ff55", -1, SQLITE_STATIC);
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
         sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO edges (source, target) VALUES (?,?)", -1, &stmt, NULL);
@@ -1518,7 +1539,8 @@ int main(int argc, char **argv) {
         "  label TEXT,"
         "  x REAL,"
         "  y REAL,"
-        "  metadata TEXT"
+        "  metadata TEXT,"
+        "  color TEXT"
         ");"
         "CREATE TABLE IF NOT EXISTS edges ("
         "  source TEXT,"
@@ -1664,11 +1686,17 @@ int main(int argc, char **argv) {
                         if (strcmp(nt->tags.tags[i], search_text) == 0) { highlight = true; break; }
                 }
             }
-            Color color = NODE_COLOR;
-            if (selected_node == n) color = SELECTED_NODE_COLOR;
-            else if (highlight) color = PURPLE;
+            Color nodeColor = NODE_COLOR; // fallback
+            if (n->color[0] == '#') {
+                unsigned int r,g,b;
+                if (sscanf(n->color, "#%02x%02x%02x", &r, &g, &b) == 3) {
+                    nodeColor = (Color){ (unsigned char)r, (unsigned char)g, (unsigned char)b, 255 };
+                }
+            }
+            if (selected_node == n) nodeColor = SELECTED_NODE_COLOR;
+            else if (highlight) nodeColor = PURPLE;
             float radius = (selected_node == n) ? SELECTED_NODE_RADIUS : NODE_RADIUS;
-            DrawCircleV((Vector2){ n->x, n->y }, radius, color);
+            DrawCircleV((Vector2){ n->x, n->y }, radius, nodeColor);
             DrawCircleLines((int)n->x, (int)n->y, radius, DARKBLUE);
             int font_size = 14;
             int text_w = MeasureText(n->label, font_size);

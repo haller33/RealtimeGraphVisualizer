@@ -200,6 +200,7 @@ void free_ui_msg(UIMsg *msg);
 void process_ui_messages(int max_count);
 void enqueue_layout_update(LayoutUpdate *upd);
 LayoutUpdate* dequeue_layout_update(void);
+LayoutUpdate* try_dequeue_layout_update(void);   // FIX: non-blocking variant
 void free_layout_update(LayoutUpdate *upd);
 void apply_layout_update_to_back(LayoutUpdate *upd);
 void* layout_thread_func(void *arg);
@@ -687,6 +688,20 @@ LayoutUpdate* dequeue_layout_update(void) {
     return upd;
 }
 
+// FIX: Non-blocking dequeue for layout thread
+LayoutUpdate* try_dequeue_layout_update(void) {
+    pthread_mutex_lock(&layout_update_mutex);
+    if (!layout_update_head) {
+        pthread_mutex_unlock(&layout_update_mutex);
+        return NULL;
+    }
+    LayoutUpdate *upd = layout_update_head;
+    layout_update_head = upd->next;
+    if (!layout_update_head) layout_update_tail = NULL;
+    pthread_mutex_unlock(&layout_update_mutex);
+    return upd;
+}
+
 void free_layout_update(LayoutUpdate *upd) {
     if (upd->metadata) free(upd->metadata);
     if (upd->tags_str) free(upd->tags_str);
@@ -907,14 +922,18 @@ void* layout_thread_func(void *arg) {
 
     while (is_running) {
         LayoutUpdate *upd;
-        while ((upd = dequeue_layout_update()) != NULL) {
+        // FIX: use non-blocking dequeue to avoid sleeping when queue empty
+        while ((upd = try_dequeue_layout_update()) != NULL) {
             apply_layout_update_to_back(upd);
             free_layout_update(upd);
         }
 
         if (layout_enabled && nodes_layout) {
-            compute_layout_iteration(nodes_layout, edges_list_layout, edges_count_layout,
-                                     use_spatial_accel, use_cage, use_collisions);
+            // FIX: Run multiple iterations per cycle to match UI thread speed
+            for (int i = 0; i < ITERATIONS_PER_FRAME; i++) {
+                compute_layout_iteration(nodes_layout, edges_list_layout, edges_count_layout,
+                                         use_spatial_accel, use_cage, use_collisions);
+            }
         }
 
         int node_count = HASH_COUNT(nodes_layout);
